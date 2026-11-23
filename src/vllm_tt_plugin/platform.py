@@ -656,7 +656,15 @@ class TTPlatform(Platform):
         speculative_config = vllm_config.speculative_config
         if speculative_config is None:
             os.environ["QWEN36_DFLASH"] = "0"
-        if speculative_config is not None:
+        if speculative_config is not None and speculative_config.method == "ngram":
+            # Model-owned prompt lookup in shared rounds (LFM3: the model's lookup_plan / lookup_round): the model
+            # proposes drafts from each request's own tokens and verifies every running request's pending token and
+            # drafts in one traced step of up to 16 rows (model_runner.py); any max_num_seqs.
+            if not 1 <= speculative_config.num_speculative_tokens <= 15:
+                raise ValueError("TT prompt-lookup speculation verifies 1..15 drafts per request and round")
+            os.environ["QWEN36_DFLASH"] = "0"
+            os.environ["QWEN36_MTP"] = "0"
+        elif speculative_config is not None:
             is_dflash = speculative_config.method == "dflash"
             if is_dflash:
                 if speculative_config.num_speculative_tokens not in (3, 7):
@@ -882,6 +890,11 @@ class TTPlatform(Platform):
                 model_class.__module__,
             )
             vllm_config.scheduler_config.async_scheduling = False
+
+        # Model-owned decode-ahead (decode_ahead.py): the model launches the next decode step of its running rows
+        # before the scheduler has run; the TT scheduler then allocates one lookahead KV slot per running request.
+        if (model_capabilities or {}).get("supports_decode_ahead", False):
+            vllm_config.additional_config["_tt_decode_lookahead"] = 1
 
         # Galaxy-generator models (Llama3 70B, Qwen3-32B) are served by a single
         # device mesh. Convert

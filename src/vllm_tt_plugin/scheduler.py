@@ -9,6 +9,7 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.request import Request
+from vllm_tt_plugin import decode_ahead
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.prefix_resume import REGISTRY
 
@@ -132,6 +133,11 @@ class TTScheduler(AsyncScheduler):
             # is model-owned, not a Mamba cache group, so its split rule below
             # deliberately does not inspect mamba_spec or cache mode.
             self.need_mamba_block_aligned_split = True
+        # Model-owned decode-ahead (decode_ahead.py): KV slots for one token beyond the scheduled one, so the step
+        # the model launches ahead (position + 1) already has its page.
+        if (self.vllm_config.additional_config or {}).get("_tt_decode_lookahead"):
+            self.num_lookahead_tokens = max(self.num_lookahead_tokens, 1)
+            decode_ahead.configure(lookahead=1)
 
     def _mamba_block_aligned_split(
         self,
@@ -202,6 +208,14 @@ class TTScheduler(AsyncScheduler):
         # requests in the waiting queue or partial-prefill continuations in
         # the running list.
         if has_pending_prefill:
+            admissible = any(r.is_prefill_chunk for r in self.running) or (
+                bool(self.waiting) and len(self.running) < self.max_num_running_reqs)
+            if admissible and has_running and decode_ahead.pending():
+                # The model already launched the running rows' next decode step (decode_ahead.py): run that decode
+                # turn first; the model launches nothing ahead of the prefill turn that follows.
+                decode_ahead.set_prefill_due(True)
+                return self._finalize_scheduler_output(self._schedule_decode_only())
+            decode_ahead.set_prefill_due(False)
             prefill_result = self._schedule_prefill_only()
             # If prefill cannot make progress (e.g., KV pressure) but running
             # decode requests exist, fall back to decode-only so they can
@@ -212,6 +226,7 @@ class TTScheduler(AsyncScheduler):
             return self._finalize_scheduler_output(prefill_result)
 
         # No pending prefill work: run decode-only naturally.
+        decode_ahead.set_prefill_due(False)
         result = super().schedule()
         return self._finalize_scheduler_output(result)
 

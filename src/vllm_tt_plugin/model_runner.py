@@ -140,13 +140,21 @@ class TTModelRunner:
             self.speculative_config is not None
             and self.speculative_config.method == "dflash"
         )
+        # Model-owned prompt lookup in shared rounds (speculative_config method "ngram"; LFM3): after every step the
+        # model plans every scheduled request's 0..depth drafts from its own tokens (lookup_plan); a decode step with
+        # drafts is one verify round over every running row (lookup_round).  Any max_num_seqs.
+        self.lookup_enabled = (
+            self.speculative_config is not None
+            and self.speculative_config.method == "ngram"
+        )
         self.mtp_enabled = (
             self.speculative_config is not None
             and not self.dflash_enabled
+            and not self.lookup_enabled
             and os.environ.get("QWEN36_MTP") == "1"
         )
-        self.speculative_method = "dflash" if self.dflash_enabled else "mtp"
-        self.speculation_enabled = self.dflash_enabled or self.mtp_enabled
+        self.speculative_method = "dflash" if self.dflash_enabled else "ngram" if self.lookup_enabled else "mtp"
+        self.speculation_enabled = self.dflash_enabled or self.mtp_enabled or self.lookup_enabled
         self.speculative_depth = self.speculative_config.num_speculative_tokens if self.speculation_enabled else 0
         self._speculative_owner: str | None = None
         # req_id -> (request state object, history owner number, resolved 64-bit seed) for exact sampling.
@@ -308,9 +316,10 @@ class TTModelRunner:
         self.supports_exact_device_sampling = bool(
             capabilities.get("supports_exact_device_sampling", False) and exact is not None and exact()
         )
-        sampled_mtp = getattr(self.model, "sampled_mtp_available", None)
+        sampled = getattr(self.model, "sampled_speculation_available", None) or getattr(
+            self.model, "sampled_mtp_available", None)
         self.supports_sampled_speculation = bool(
-            self.supports_exact_device_sampling and sampled_mtp is not None and sampled_mtp()
+            self.supports_exact_device_sampling and sampled is not None and sampled()
         )
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
@@ -1196,7 +1205,11 @@ class TTModelRunner:
             prompt_lens = None
             scheduled_drafts = scheduler_output.scheduled_spec_decode_tokens
             speculative_drafts = None
-            if self.speculation_enabled and len(req_indices) == 1:
+            if self.lookup_enabled:
+                # Prompt lookup: a shared verify round over every running row (each row its own 0..depth drafts)
+                speculative_drafts = self._lookup_round_drafts(
+                    req_indices, input_positions, scheduled_drafts, num_sched)
+            elif self.speculation_enabled and len(req_indices) == 1:
                 req_index = req_indices[0]
                 req_id = input_batch.req_ids[req_index]
                 drafts = [int(t) for t in scheduled_drafts.get(req_id, ())]
@@ -1312,12 +1325,19 @@ class TTModelRunner:
             perform_device_sampling = False
 
         exact_sampling = None
-        if not is_prompt and speculative_drafts is None:
+        if not is_prompt and (speculative_drafts is None or self.lookup_enabled):
             exact_sampling = self._exact_sampling_rows(
                 [input_batch.req_ids[i] for i in req_indices], has_structured
             )
             if exact_sampling is not None:
                 perform_device_sampling = True
+        if self.lookup_enabled and not is_prompt and speculative_drafts is not None and not (
+                (exact_sampling is None and input_batch.all_greedy
+                 and self._device_sampling_request_supported(has_structured))
+                or (exact_sampling is not None and self.supports_sampled_speculation)):
+            # a shared verify round needs every row on the device sampler (all greedy: the device argmax; else the
+            # exact sampler); otherwise this is a plain step and the scheduled drafts count as rejected
+            speculative_drafts = None
 
         # Preserve the prompt/output distinction for penalty sampling, including
         # the final recomputation chunk of a preempted request.
@@ -1442,12 +1462,16 @@ class TTModelRunner:
         )
 
     def _exact_sampling_request(self, req_id: str):
-        """A device_sampling.SamplingRequest for req_id, or None when the host sampler must handle it."""
+        """A device_sampling.SamplingRequest for req_id, or None when the host sampler must handle it. A model may
+        provide its own sampler rules: `exact_sampling_eligible(params, n_out)` and `exact_sampling_spec(params,
+        seed)` (else Qwen36's device_eligible / row_sampling)."""
         from models.demos.blackhole.qwen36.tt.device_sampling import SamplingRequest, device_eligible, row_sampling
 
+        eligible = getattr(self.model, "exact_sampling_eligible", device_eligible)
+        make_spec = getattr(self.model, "exact_sampling_spec", row_sampling)
         state = self.requests[req_id]
         params = state.sampling_params
-        if not device_eligible(params, len(state.output_token_ids)):
+        if not eligible(params, len(state.output_token_ids)):
             return None
         owner = self._exact_owners.get(req_id)
         if owner is None or owner[0] is not state:
@@ -1459,7 +1483,7 @@ class TTModelRunner:
             self._exact_owners[req_id] = owner
         return SamplingRequest(
             owner=owner[1],
-            spec=row_sampling(params, owner[2]),
+            spec=make_spec(params, owner[2]),
             outputs=state.output_token_ids,
             prompt=state.prompt_token_ids if params.repetition_penalty != 1.0 else None,
         )
@@ -2606,6 +2630,8 @@ class TTModelRunner:
             )
         if isinstance(fwd.tt_out, tuple) and fwd.tt_out and fwd.tt_out[0] == "tt_speculative":
             return self._finish_speculative(fwd)
+        if isinstance(fwd.tt_out, tuple) and fwd.tt_out and fwd.tt_out[0] == "tt_lookup_round":
+            return self._finish_lookup_round(fwd)
         fwd = replace(
             fwd,
             model_input=self._apply_grammar_to_input(
@@ -2625,6 +2651,8 @@ class TTModelRunner:
 
             if intermediate_mask.any():
                 output_req_ids = list(self.input_batch.req_ids[:num_reqs])
+                if self.lookup_enabled:
+                    self._pending_draft_token_ids = self._lookup_plan(after_prefill=True)
                 return self._build_chunked_prefill_output(
                     req_ids=output_req_ids,
                     sampled_token_ids=sampled_token_ids,
@@ -2634,6 +2662,9 @@ class TTModelRunner:
 
         out = self.apply_and_build_runner_output(sampled_token_ids, logprobs)
         self._pending_draft_token_ids = None
+        if self.lookup_enabled:
+            self._pending_draft_token_ids = self._lookup_plan(after_prefill=not fwd.is_decode)
+            return out
         speculate, spec_request = False, None
         if (
             self.speculation_enabled
@@ -2697,6 +2728,123 @@ class TTModelRunner:
             prompt_logprobs_dict=dict.fromkeys(output_req_ids, None),
             pooler_output=[],
         )
+
+    # --- Model-owned prompt lookup in shared rounds (speculative_config method "ngram"; LFM3) ---
+    # After every step the model plans each scheduled request's drafts for the next round (lookup_plan); a decode step
+    # whose requests carry drafts is one shared verify round over every running row (lookup_round), each request
+    # emitting its accepted drafts plus one token.
+
+    def _finish_lookup_round(self, fwd: _SyncForward) -> ModelRunnerOutput:
+        _, emitted = fwd.tt_out
+        num_reqs = self.input_batch.num_reqs
+        output_req_ids = list(self.input_batch.req_ids[:num_reqs])
+        committed = [self._lookup_commit(req_id, e) for req_id, e in zip(output_req_ids, emitted)]
+        self._pending_draft_token_ids = self._lookup_plan(after_prefill=False)
+        return ModelRunnerOutput(
+            req_ids=output_req_ids,
+            req_id_to_index={r: i for i, r in enumerate(output_req_ids)},
+            sampled_token_ids=committed,
+            logprobs=None,
+            prompt_logprobs_dict=dict.fromkeys(output_req_ids, None),
+            pooler_output=[],
+        )
+
+    def _lookup_commit(self, req_id: str, emitted) -> list[int]:
+        """Apply a round's emitted tokens to req_id's runner state, stopping at the scheduler's boundary (not past
+        EOS / max_tokens / max_model_len) -> the committed tokens."""
+        state = self.requests[req_id]
+        committed = []
+        for tok in emitted:
+            state.output_token_ids.append(int(tok))
+            committed.append(int(tok))
+            if self._speculation_stopped(req_id):
+                break
+        row = self.input_batch.req_id_to_index.get(req_id)
+        if row is not None:
+            start = int(self.input_batch.num_tokens[row])
+            end = start + len(committed)
+            assert end <= self.model_config.max_model_len, (
+                f"Sampled token IDs exceed the max model length: {end} > {self.model_config.max_model_len}"
+            )
+            self.input_batch.token_ids_cpu[row, start:end] = committed
+            self.input_batch.num_tokens[row] = end
+        return committed
+
+    def _lookup_request_eligible(self, req_id: str) -> bool:
+        """May req_id's rows ride a shared verify round (sampled on the device: the argmax when greedy, else the
+        model's exact sampler)?"""
+        state = self.requests[req_id]
+        params = state.sampling_params
+        if self.model_config.logits_processors:
+            return False
+        eligible = getattr(self.model, "exact_sampling_eligible", None)
+        if eligible is None or not eligible(params, len(state.output_token_ids)):
+            return False
+        greedy = (params.temperature < 1e-5 and params.repetition_penalty == 1.0
+                  and params.presence_penalty == 0.0 and params.frequency_penalty == 0.0)
+        return greedy or self.supports_sampled_speculation
+
+    def _lookup_plan(self, after_prefill: bool) -> DraftTokenIds | None:
+        """Every scheduled request's drafts for the next round: an explicit list each, [] for none (the TT scheduler,
+        an AsyncScheduler, leaves [-1] * depth placeholder drafts on every scheduled request; kept, they would
+        schedule depth + 1 tokens for a plain row).  The model plans the round from the requests that may speculate
+        (decode phase, not stopped, room left, sampled on the device), each with its state slot."""
+        num_reqs = self.input_batch.num_reqs
+        req_ids = list(self.input_batch.req_ids[:num_reqs])
+        if not req_ids:
+            return None
+        cfg = self.speculative_config
+        entries, rows = [], []
+        for i, req_id in enumerate(req_ids):
+            state = self.requests.get(req_id)
+            slot = self._req_state_slot.get(req_id)
+            if (state is None or slot is None or req_id in self._prefilling_req_ids
+                    or self._speculation_stopped(req_id)
+                    or self._speculation_remaining(req_id) < 2
+                    or not self._speculation_context_fits(state.num_tokens - 1)
+                    or not self._lookup_request_eligible(req_id)):
+                continue
+            params = state.sampling_params
+            stop = (() if params.ignore_eos or len(state.output_token_ids) < params.min_tokens
+                    else tuple(params.all_stop_token_ids))
+            entries.append(((req_id, id(state)), slot, state.prompt_token_ids, state.output_token_ids,
+                            self._speculation_remaining(req_id), self.speculative_depth, stop,
+                            cfg.prompt_lookup_min, cfg.prompt_lookup_max))
+            rows.append(i)
+        drafts = [[] for _ in req_ids]
+        if entries:
+            for i, proposed in zip(rows, self.model.lookup_plan(entries, after_prefill)):
+                ok = []
+                for t in proposed:
+                    if not 0 <= int(t) < self.vocab_size:
+                        break
+                    ok.append(int(t))
+                drafts[i] = ok
+        return DraftTokenIds(req_ids, drafts)
+
+    def _lookup_round_drafts(self, req_indices, input_positions, scheduled_drafts, num_sched):
+        """Per decode row the scheduled drafts it verifies in the shared round ([] when a check fails: those drafts
+        count as rejected), or None when no row has any (a plain decode step)."""
+        input_batch = self.input_batch
+        out, any_drafts = [], False
+        for row, req_index in enumerate(req_indices):
+            req_id = input_batch.req_ids[req_index]
+            drafts = [int(t) for t in scheduled_drafts.get(req_id, ())]
+            position = int(input_positions[row])
+            # Ownership is the scheduler's real list, never padded block_tables.
+            owned_pages = self.requests[req_id].block_ids[0]
+            needed_pages = (position + len(drafts)) // self.cache_config.block_size + 1
+            if not (1 <= len(drafts) <= self.speculative_depth
+                    and all(0 <= t < self.vocab_size for t in drafts)
+                    and len(owned_pages) >= needed_pages
+                    and num_sched[req_id] == len(drafts) + 1
+                    and int(input_batch.num_computed_tokens_cpu[req_index]) == position
+                    and self._speculation_remaining(req_id) >= len(drafts) + 1
+                    and self._speculation_context_fits(position)):
+                drafts = []
+            any_drafts |= bool(drafts)
+            out.append(drafts)
+        return out if any_drafts else None
 
     def _speculation_context_fits(self, position: int) -> bool:
         limit = self.model_config.max_model_len
@@ -3009,6 +3157,41 @@ class TTModelRunner:
                 tt_out, tt_log_probs = tt_out
             elif isinstance(tt_out, tuple):
                 tt_out, _ = tt_out
+        elif self.lookup_enabled and model_input.speculative_drafts is not None:
+            # A shared verify round (the model's lookup_round): every running row with its own drafts (possibly none)
+            # in one traced step; the rows' sampling is the exact device sampler (model_input.exact_sampling) or, all
+            # greedy, the device argmax.  Verification advances committed host state, not the ordinary decode/sampler
+            # inputs: their reset stays pending until an ordinary decode consumes the committed tokens and positions.
+            self._decode_layout_changed_since_last_decode = True
+            _t0 = time.perf_counter()
+            n = model_input.unpadded_batch_size
+            emitted = self.model.lookup_round(
+                [int(t) for t in model_input.input_tokens[:n, 0].tolist()],
+                model_input.speculative_drafts,
+                [int(p) for p in model_input.input_positions[:n].tolist()],
+                model_input.block_tables,
+                model_input.exact_sampling,
+                model_input.slot_remap,
+            )
+            stats = self._speculative_stats = getattr(
+                self, "_speculative_stats", {"cycles": 0, "rows": 0, "accepted": 0, "ms": 0.0})
+            stats["cycles"] += 1
+            stats["rows"] += n
+            stats["accepted"] += sum(len(e) - 1 for e in emitted)
+            stats["ms"] += (time.perf_counter() - _t0) * 1000
+            if stats["cycles"] % 256 == 0:
+                logger.info("TT ngram shared rounds=%d streams/round=%.2f accepted=%d mean_round_ms=%.3f",
+                            stats["cycles"], stats["rows"] / stats["cycles"], stats["accepted"],
+                            stats["ms"] / stats["cycles"])
+            return _SyncForward(
+                tt_out=("tt_lookup_round", emitted),
+                tt_log_probs=None,
+                sampling_params=sampling_params,
+                model_input=model_input,
+                batch_size_per_dp=batch_size_per_dp,
+                perform_device_sampling=False,
+                is_decode=True,
+            )
         elif (
             self.speculation_enabled
             and model_input.speculative_drafts is not None
