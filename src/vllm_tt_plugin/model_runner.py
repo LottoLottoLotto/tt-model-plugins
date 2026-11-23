@@ -1445,6 +1445,8 @@ class TTModelRunner:
         """A device_sampling.SamplingRequest for req_id, or None when the host sampler must handle it."""
         from models.demos.blackhole.qwen36.tt.device_sampling import SamplingRequest, device_eligible, row_sampling
 
+        # A model may declare its own exactly-sampled set (Inkling-2-Mini: the full-vocabulary device sampler).
+        device_eligible = getattr(self.model, "device_sampling_eligible", device_eligible)
         state = self.requests[req_id]
         params = state.sampling_params
         if not device_eligible(params, len(state.output_token_ids)):
@@ -2927,6 +2929,14 @@ class TTModelRunner:
             "prompt_lens": model_input.prompt_lens,
             "start_pos": model_input.input_positions,
         }
+        from vllm_tt_plugin.prefix_resume import REGISTRY
+
+        if REGISTRY.active and model_input.intermediate_prefill_mask is not None:
+            # Exact prefix resume: the request of each row (the model asks the registry whether
+            # it was resumed) and the rows that end their prompt in this step.
+            rows = int(model_input.unpadded_batch_size)
+            kwargs["prefill_request_ids"] = list(self.input_batch.req_ids[:rows])
+            kwargs["prefill_final_rows"] = (~model_input.intermediate_prefill_mask[:rows]).tolist()
         # Hybrid attention models route per-layer block tables; the
         # runner already expanded ``block_tables_per_group`` into a
         # per-layer list at submission time when the kv_cache_config has

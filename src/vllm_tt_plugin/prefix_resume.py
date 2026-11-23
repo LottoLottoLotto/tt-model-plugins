@@ -64,15 +64,31 @@ class PrefixResume:
         self._lengths: dict[int, int] = {}  # length -> number of snapshots with it
         self._pending: dict[str, bytes] = {}  # request id -> key handed to the scheduler
         self._epoch: dict[int, int] = {}
+        self.fork_hints = False  # scheduler asks for snapshots where cached prompts fork
+        self._wanted: OrderedDict[bytes, int] = OrderedDict()  # prefix key -> boundary
+        self.on_drop = None  # model callback(payload) when a snapshot leaves the registry
+        self._private: set[str] = set()  # requests whose state must not be shared (cache_salt, LoRA, multimodal)
         self.stats = {"queries": 0, "hits": 0, "hit_tokens": 0, "query_tokens": 0, "puts": 0,
                       "evicted": 0, "stale": 0}
 
     # ---- model side -------------------------------------------------------------------------
-    def configure(self, align: int, block_size: int, max_snapshots: int) -> None:
+    def configure(self, align: int, block_size: int, max_snapshots: int, fork_hints: bool = False,
+                  on_drop=None) -> None:
+        """``on_drop(payload)``: called (under the registry lock; it must not call back into the
+        registry) whenever a snapshot leaves the registry: evicted, stale, replaced. A payload with a
+        ``valid()`` method is checked at every lookup (False = stale: the model's own state behind it
+        was overwritten). A new configuration drops every snapshot of the previous one (through the
+        previous on_drop)."""
         if align <= 0 or block_size <= 0 or align % block_size:
             raise ValueError("resume alignment must be a positive multiple of the KV block size")
         with self._lock:
+            for key in list(self._snapshots):
+                self._drop(key)
+            self._pending.clear()
+            self._wanted.clear()
             self.align, self.block_size, self.max_snapshots = align, block_size, max(0, max_snapshots)
+            self.fork_hints = fork_hints
+            self.on_drop = on_drop
         logger.info("Prefix resume: chunk %d, block %d, max snapshots %d", align, block_size, max_snapshots)
 
     @property
@@ -91,9 +107,8 @@ class PrefixResume:
             raise ValueError("snapshot needs one real (non-null) KV block per prefix block")
         key = token_key(tokens, length)
         with self._lock:
-            old = self._snapshots.pop(key, None)
-            if old is not None:
-                self._forget_length(old.length)
+            if key in self._snapshots:
+                self._drop(key)
             self._snapshots[key] = _Snapshot(
                 length, block_ids, tuple(self._epoch.get(b, 0) for b in block_ids), payload, int(nbytes)
             )
@@ -101,22 +116,86 @@ class PrefixResume:
             self.stats["puts"] += 1
             pinned = set(self._pending.values())
             for victim in [k for k in self._snapshots if k not in pinned][: max(0, len(self._snapshots) - self.max_snapshots)]:
-                self._forget_length(self._snapshots.pop(victim).length)
+                self._drop(victim)
                 self.stats["evicted"] += 1
 
-    def take(self, tokens, length: int) -> Any:
-        """Payload of the snapshot the scheduler resumed this prefill from."""
+    def evict_one(self) -> bool:
+        """Drop the least recently used snapshot no scheduled request is waiting for (a model whose
+        snapshot storage is full makes room); False when every snapshot is pinned."""
+        with self._lock:
+            pinned = set(self._pending.values())
+            for key in self._snapshots:
+                if key not in pinned:
+                    self._drop(key)
+                    self.stats["evicted"] += 1
+                    return True
+            return False
+
+    def release(self, request_id: str) -> None:
+        """The request is gone (finished, aborted): it no longer pins the snapshot it was found at."""
+        with self._lock:
+            self._pending.pop(request_id, None)
+            self._private.discard(request_id)
+
+    def shareable(self, request_id: str | None) -> bool:
+        """Whether the state of this request's prefill may be published for other requests (False for cache_salt,
+        LoRA and multimodal requests: they neither resume nor publish)."""
+        return request_id not in self._private
+
+    def _drop(self, key: bytes) -> None:
+        snapshot = self._snapshots.pop(key)
+        self._forget_length(snapshot.length)
+        if self.on_drop is not None:
+            self.on_drop(snapshot.payload)
+
+    def take(self, tokens, length: int, request_id: str | None = None) -> Any:
+        """Payload of the snapshot the scheduler resumed this prefill from. With ``request_id``
+        only that request is unpinned: concurrent requests may resume from one snapshot."""
         key = token_key(tokens, length)
         with self._lock:
             snapshot = self._snapshots.get(key)
-            for request_id in [r for r, k in self._pending.items() if k == key]:
-                del self._pending[request_id]
+            if request_id is not None:
+                if self._pending.pop(request_id, None) != key:
+                    raise RuntimeError(f"request {request_id} was not scheduled to resume at {length}")
+            else:
+                for pinned in [r for r, k in self._pending.items() if k == key]:
+                    del self._pending[pinned]
             if snapshot is None or snapshot.length != length:
                 raise RuntimeError(f"no prefix-resume snapshot for the scheduled {length}-token prefix")
             self._snapshots.move_to_end(key)
             return snapshot.payload
 
+    def resuming(self, request_id: str) -> bool:
+        """Whether the scheduler resumed this request from a snapshot (not yet taken)."""
+        with self._lock:
+            return request_id in self._pending
+
+    def has(self, tokens, length: int) -> bool:
+        if length not in self._lengths:
+            return False
+        key = token_key(tokens, length)
+        with self._lock:
+            return key in self._snapshots
+
+    def wanted(self, tokens, length: int) -> bool:
+        """Consume a scheduler request to snapshot ``tokens[:length]`` (a fork boundary)."""
+        with self._lock:
+            if length not in self._wanted.values():
+                return False
+            return self._wanted.pop(token_key(tokens, length), None) is not None
+
     # ---- scheduler side ---------------------------------------------------------------------
+    def want(self, tokens, length: int) -> None:
+        """Ask the model to snapshot ``tokens[:length]`` when a prefill crosses that boundary."""
+        key = token_key(tokens, length)
+        with self._lock:
+            if key in self._snapshots:
+                return
+            self._wanted[key] = length
+            self._wanted.move_to_end(key)
+            while len(self._wanted) > 4 * max(1, self.max_snapshots):
+                self._wanted.popitem(last=False)
+
     def on_new_blocks(self, blocks) -> None:
         epoch = self._epoch
         for block in blocks:
@@ -137,10 +216,13 @@ class PrefixResume:
                 snapshot = self._snapshots.get(key)
                 if snapshot is None:
                     continue
-                if any(self._epoch.get(b, 0) != e for b, e in zip(snapshot.block_ids, snapshot.epochs)):
-                    # A prefix block was reallocated and rewritten: the snapshot can never be used.
-                    del self._snapshots[key]
-                    self._forget_length(length)
+                valid = getattr(snapshot.payload, "valid", None)
+                if any(self._epoch.get(b, 0) != e for b, e in zip(snapshot.block_ids, snapshot.epochs)) or (
+                    valid is not None and not valid()
+                ):
+                    # A prefix block was reallocated and rewritten (or the model's own state behind
+                    # the snapshot was): the snapshot can never be used.
+                    self._drop(key)
                     self.stats["stale"] += 1
                     continue
                 self._snapshots.move_to_end(key)
@@ -177,12 +259,17 @@ class PrefixResume:
             if self.align is None:
                 # The model never configured resume: plain vLLM prefix caching semantics.
                 return vllm_get_computed_blocks(request)
-            if (
-                request.skip_reading_prefix_cache
-                or request.mm_features
-                or request.lora_request is not None
-                or getattr(request, "cache_salt", None)
-            ):
+            # cache_salt / LoRA / multimodal requests neither resume nor publish (their state is not another
+            # request's); prompt-logprobs requests (skip_reading_prefix_cache) prefill fully but may publish
+            private = bool(
+                request.mm_features or request.lora_request is not None or getattr(request, "cache_salt", None)
+            )
+            with self._lock:
+                if private:
+                    self._private.add(request.request_id)
+                else:
+                    self._private.discard(request.request_id)
+            if private or request.skip_reading_prefix_cache:
                 length, block_ids = 0, ()
             else:
                 length, block_ids = self.find(request.request_id, request.all_token_ids, request.num_tokens - 1)
@@ -190,6 +277,17 @@ class PrefixResume:
                 kv_cache_manager.prefix_cache_stats.record(
                     num_tokens=request.num_tokens, num_hits=length, preempted=request.num_preemptions > 0
                 )
+            if self.fork_hints and self.max_snapshots and not private:
+                # vLLM's block hashes only locate where this prompt leaves another cached prompt
+                # (shared system prompt / document); their KV is never reused. The prefill
+                # publishes a snapshot at the last chunk boundary inside the shared part, so
+                # later requests with that prefix resume there.
+                shared = kv_cache_manager.coordinator.find_longest_cache_hit(
+                    request.block_hashes, request.num_tokens - 1
+                )[1]
+                fork = shared // self.align * self.align
+                if fork > length:
+                    self.want(request.all_token_ids, fork)
             if not length:
                 return kv_cache_manager.empty_kv_cache_blocks, 0
             logger.info("Prefix resume: request %s resumes at %d of %d tokens", request.request_id, length,

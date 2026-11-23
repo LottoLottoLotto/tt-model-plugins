@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import ClassVar
@@ -127,6 +128,10 @@ class TTScheduler(AsyncScheduler):
             (self.vllm_config.additional_config or {}).get("_tt_qwen_batched_prefill", False)
         )
         self._prefill_turn_due = False
+        # TT_DECODE_LOOKAHEAD (Inkling-2-Mini batched speculation): decode steps allocate KV blocks this many tokens
+        # past the scheduled token (vLLM's num_lookahead_tokens, clamped to max_model_len): the model's speculative
+        # cycles run ahead of vLLM's one-token steps and write the K / V of those positions into the request's blocks.
+        self.num_lookahead_tokens = max(self.num_lookahead_tokens, int(os.environ.get("TT_DECODE_LOOKAHEAD", "0")))
         if self._qwen_batched_prefill:
             # Reuse the upstream pre-allocation alignment hook. Qwen's state
             # is model-owned, not a Mamba cache group, so its split rule below
@@ -154,8 +159,22 @@ class TTScheduler(AsyncScheduler):
             # Every non-final chunk ends on a GDN scan boundary (128) and
             # therefore also a paged-KV boundary (64). A short remaining turn
             # budget simply leaves this request for the next prefill turn.
-            return max(0, (start + num_new_tokens) // 128 * 128 - start)
+            # TT_PREFILL_CHUNK_ALIGN (Inkling-2-Mini batched serving: 2048 = the
+            # turn budget): non-final chunks end on multiples of it, so a
+            # request's chunk boundaries do not depend on the other requests of
+            # the turn (its prefill numerics equal those of the request alone).
+            # With prefix caching (exact prefix resume) they end on the model's
+            # resume alignment instead: snapshots and resumes then fall on
+            # boundaries a full prefill crosses.
+            align = (REGISTRY.align if (self.cache_config.enable_prefix_caching and REGISTRY.align)
+                     else int(os.environ.get("TT_PREFILL_CHUNK_ALIGN", "128")))
+            return max(0, (start + num_new_tokens) // align * align - start)
         return num_new_tokens
+
+    def _free_request(self, request: Request, delay_free_blocks: bool = False):
+        # A finished / aborted request no longer pins the resume snapshot it was scheduled from.
+        REGISTRY.release(request.request_id)
+        return super()._free_request(request, delay_free_blocks=delay_free_blocks)
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
