@@ -10,6 +10,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.request import Request
 from vllm_tt_plugin.logger import init_tt_logger
+from vllm_tt_plugin.prefix_resume import REGISTRY
 
 logger = init_tt_logger(__name__)
 
@@ -120,6 +121,9 @@ class TTScheduler(AsyncScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._forced_mode = TTSchedulingMode.DEFAULT
+        if self.cache_config.enable_prefix_caching:
+            # Prefix hits come from exact model-side resume snapshots, not raw block hashes.
+            REGISTRY.attach(self.kv_cache_manager)
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode

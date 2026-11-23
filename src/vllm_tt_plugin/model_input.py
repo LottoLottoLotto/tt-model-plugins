@@ -130,3 +130,11 @@ class TTModelInput:
     # Prefill-only: rows whose forward contributes KV state but must not
     # consume a sampling RNG draw because more prompt tokens remain.
     intermediate_prefill_mask: torch.Tensor | None = None
+
+    # Decode-only: a speculative step of the model-owned drafter (placeholder
+    # draft ids reserve the verify rows; see TTModelRunner._speculative_step).
+    speculative: bool = False
+
+    # Decode-only: per-row device_sampling.SamplingRequest for exact on-device sampling of this step
+    # (None: the host sampler). Also the request of a sampled speculative step.
+    exact_sampling: list[Any] | None = None

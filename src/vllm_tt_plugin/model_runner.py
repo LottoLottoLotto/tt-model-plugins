@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from collections import deque
 from dataclasses import dataclass, fields, replace
@@ -24,6 +25,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
+    DraftTokenIds,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
@@ -132,6 +134,21 @@ class TTModelRunner:
         self.parallel_config = vllm_config.parallel_config
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
+        # Model-owned exact greedy speculation (method gemma4_assistant): one
+        # step runs draft + verify on device and commits 1..K+1 tokens. The
+        # scheduler reserves the K verify rows through placeholder draft ids.
+        self.speculative_draft_len = (
+            self.speculative_config.num_speculative_tokens
+            if self.speculative_config is not None
+            else 0
+        )
+        self._pending_draft_token_ids: DraftTokenIds | None = None
+        # Exact vLLM-equivalent device sampling (model capability supports_exact_device_sampling):
+        # req_id -> (request state object, history owner number, resolved 64-bit seed).
+        self._exact_owners: dict[str, tuple[Any, int, int]] = {}
+        self._exact_owner_counter = 0
+        self.supports_exact_device_sampling = False
+        self.supports_sampled_speculation = False
         self.observability_config = vllm_config.observability_config
         self.device_config = vllm_config.device_config
 
@@ -266,6 +283,18 @@ class TTModelRunner:
         loader = TTModelLoader(self.load_config)
         self.model = loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
+        )
+        # Exact device sampling of decode rows (penalties, temperature, min_p, top-k <= 64, top-p; counter RNG)
+        # and, with model-owned speculation, lossless speculative sampling of random / penalized requests.
+        capabilities = getattr(self.model, "model_capabilities", {})
+        exact = getattr(self.model, "exact_sampling_available", None)
+        self.supports_exact_device_sampling = bool(
+            capabilities.get("supports_exact_device_sampling", False) and exact is not None and exact()
+        )
+        sampled = getattr(self.model, "sampled_speculation_available", None)
+        self.supports_sampled_speculation = bool(
+            self.supports_exact_device_sampling and self.speculative_draft_len
+            and sampled is not None and sampled()
         )
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
@@ -610,9 +639,19 @@ class TTModelRunner:
         """
         persistent_batch_layout_changed = False
 
+        # Drop drafts proposed for requests that finished or were preempted.
+        dead = set(scheduler_output.finished_req_ids) | set(
+            scheduler_output.preempted_req_ids or ()
+        )
+        if self._pending_draft_token_ids is not None and dead.intersection(
+            self._pending_draft_token_ids.req_ids
+        ):
+            self._pending_draft_token_ids = None
+
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
+            self._exact_owners.pop(req_id, None)
         self._release_dead_state_slots(scheduler_output)
 
         # Remove the finished requests from the persistent batch.
@@ -1224,11 +1263,21 @@ class TTModelRunner:
             # state available before inputs are gathered.
             perform_device_sampling = False
 
+        # Exact device sampling: eligible random / penalized decode rows draw on device (the model returns
+        # token ids); all-greedy unpenalized batches and ineligible requests keep the host path.
+        exact_sampling = None
+        if not is_prompt:
+            exact_sampling = self._exact_sampling_rows(
+                [input_batch.req_ids[i] for i in req_indices], has_structured
+            )
+            if exact_sampling is not None:
+                perform_device_sampling = True
+
         # Populate prompt_tokens and output_tokens if penalties are needed
-        # (decode only).
+        # (decode only, host sampler).
         prompt_tokens = None
         output_tokens = None
-        if (not input_batch.no_penalties) and not is_prompt:
+        if (not input_batch.no_penalties) and not is_prompt and exact_sampling is None:
             # Restrict to this build's requests. For lane builds ``req_indices``
             # selects one lane's rows out of the merged batch; passing them
             # keeps penalty history attributed to the right requests instead of
@@ -1314,7 +1363,19 @@ class TTModelRunner:
             prefill_empty_slots = None
             slot_remap = self._decode_state_slot_remap(row_req_ids)
 
+        speculative = False
+        if not is_prompt and self.speculative_draft_len and num_reqs == 1:
+            req_id = input_batch.req_ids[0]
+            drafts = scheduler_output.scheduled_spec_decode_tokens.get(req_id, ())
+            speculative = (
+                len(drafts) == self.speculative_draft_len
+                and num_sched[req_id] == self.speculative_draft_len + 1
+                and int(input_positions[0]) == int(input_batch.num_computed_tokens_cpu[0])
+                and self._speculation_eligible(req_id, int(input_positions[0]))
+            )
+
         return TTModelInput(
+            speculative=speculative,
             input_tokens=input_tokens,
             input_positions=input_positions,
             prompt_lens=prompt_lens,
@@ -1341,6 +1402,7 @@ class TTModelRunner:
             # state. Stateless models ignore it.
             prefill_empty_slots=prefill_empty_slots,
             intermediate_prefill_mask=intermediate_prefill_mask,
+            exact_sampling=exact_sampling,
         )
 
     def build_model_input(
@@ -2454,6 +2516,15 @@ class TTModelRunner:
             return self.apply_and_build_runner_output(
                 torch.tensor([], dtype=torch.int32), None
             )
+        if isinstance(fwd.tt_out, tuple) and fwd.tt_out[0] == "tt_speculative":
+            return self._finish_speculative(fwd.tt_out[1])
+        out = self._finish_nondp_sample(grammar_output, fwd)
+        self._propose_placeholder_drafts()
+        return out
+
+    def _finish_nondp_sample(
+        self, grammar_output: GrammarOutput | None, fwd: _SyncForward
+    ) -> ModelRunnerOutput:
         fwd = replace(
             fwd,
             model_input=self._apply_grammar_to_input(
@@ -2481,6 +2552,136 @@ class TTModelRunner:
                 )
 
         return self.apply_and_build_runner_output(sampled_token_ids, logprobs)
+
+    # ---- model-owned speculation (method gemma4_assistant) ----------------
+    def _finish_speculative(self, committed: list[int]) -> ModelRunnerOutput:
+        """Apply the committed tokens up to the first stop boundary (the same
+        boundary the scheduler applies) and propose the next step."""
+        req_id = self.input_batch.req_ids[0]
+        applied = []
+        for tok in committed:
+            self._apply_sampled_tokens_to_state(torch.tensor([[tok]], dtype=torch.int32))
+            applied.append(int(tok))
+            if self._speculation_stopped(req_id):
+                break
+        self._propose_placeholder_drafts()
+        output_req_ids = list(self.input_batch.req_ids[: self.input_batch.num_reqs])
+        return ModelRunnerOutput(
+            req_ids=output_req_ids,
+            req_id_to_index={r: i for i, r in enumerate(output_req_ids)},
+            sampled_token_ids=[applied],
+            logprobs=None,
+            prompt_logprobs_dict=dict.fromkeys(output_req_ids, None),
+            pooler_output=[],
+        )
+
+    def _propose_placeholder_drafts(self) -> None:
+        """Reserve the next step's K verify rows (draft ids are placeholders:
+        the model drafts on device) when the single request can take a full
+        speculative step; otherwise the next step is an ordinary decode."""
+        self._pending_draft_token_ids = None
+        if not self.speculative_draft_len or self.input_batch.num_reqs != 1:
+            return
+        req_id = self.input_batch.req_ids[0]
+        num_tokens = int(self.input_batch.num_tokens[0])
+        if num_tokens < int(self.input_batch.num_prompt_tokens[0]) + 1:
+            return  # prompt not finished (intermediate prefill chunk)
+        if self._speculation_stopped(req_id) or not self._speculation_eligible(
+            req_id, num_tokens - 1
+        ):
+            return
+        self._pending_draft_token_ids = DraftTokenIds(
+            [req_id], [[0] * self.speculative_draft_len]
+        )
+
+    def _speculation_eligible(self, req_id: str, position: int) -> bool:
+        """Greedy unpenalized request (exact greedy cycle) or a request the device sampler processes exactly
+        (sampled cycle), without host-only sampling features, room for a whole step (K+1 tokens) and its
+        verify rows inside the context."""
+        batch = self.input_batch
+        state = self.requests[req_id]
+        params = state.sampling_params
+        remaining = self.model_config.max_model_len - int(batch.num_tokens[0])
+        if params.max_tokens is not None:
+            remaining = min(remaining, params.max_tokens - len(state.output_token_ids))
+        greedy = batch.all_greedy and batch.no_penalties
+        sampled = (not greedy and self.supports_sampled_speculation
+                   and self._exact_sampling_request(req_id) is not None)
+        return (
+            (greedy or sampled)
+            and batch.no_allowed_token_ids
+            and not batch.sampling.bad_words_token_ids
+            and not batch.sampling.has_active_logitsprocs()
+            and not self.model_config.logits_processors
+            and batch.max_num_logprobs is None
+            and params.structured_outputs is None
+            and remaining >= self.speculative_draft_len + 1
+            and position + self.speculative_draft_len < self.model_config.max_model_len - 1
+        )
+
+    def _exact_sampling_request(self, req_id: str):
+        """A device_sampling.SamplingRequest for req_id, or None when the host sampler must handle it."""
+        from models.demos.gemma4.tt.device_sampling import SamplingRequest, device_eligible, row_sampling
+
+        state = self.requests[req_id]
+        params = state.sampling_params
+        if not device_eligible(params, len(state.output_token_ids)):
+            return None
+        owner = self._exact_owners.get(req_id)
+        if owner is None or owner[0] is not state:
+            # One history owner per request lifetime (an aborted and resubmitted id gets a new one). Unseeded
+            # requests draw a random 64-bit base seed for the counter-based RNG.
+            self._exact_owner_counter += 1
+            seed = params.seed if params.seed is not None else int.from_bytes(os.urandom(8), "little")
+            owner = (state, self._exact_owner_counter, seed)
+            self._exact_owners[req_id] = owner
+        return SamplingRequest(
+            owner=owner[1],
+            spec=row_sampling(params, owner[2]),
+            outputs=state.output_token_ids,
+            prompt=state.prompt_token_ids if params.repetition_penalty != 1.0 else None,
+        )
+
+    def _exact_sampling_rows(self, req_ids: list[str], has_structured: bool):
+        """Per-row exact device sampling requests for a decode step, or None for the host sampler: all-greedy
+        unpenalized batches keep their existing path; any ineligible row sends the whole step to the host."""
+        if not self.supports_exact_device_sampling or has_structured or not req_ids:
+            return None
+        if self.model_config.logits_processors:
+            return None
+        if self.input_batch.all_greedy and self.input_batch.no_penalties:
+            return None
+        rows = []
+        for req_id in req_ids:
+            request = self._exact_sampling_request(req_id)
+            if request is None:
+                return None
+            rows.append(request)
+        return rows
+
+    def _speculation_stopped(self, req_id: str) -> bool:
+        state = self.requests[req_id]
+        params = state.sampling_params
+        remaining = (
+            self.model_config.max_model_len
+            - state.num_prompt_tokens
+            - len(state.output_token_ids)
+        )
+        if params.max_tokens is not None:
+            remaining = min(remaining, params.max_tokens - len(state.output_token_ids))
+        if remaining <= 0:
+            return True
+        return (
+            bool(state.output_token_ids)
+            and len(state.output_token_ids) >= params.min_tokens
+            and not params.ignore_eos
+            and state.output_token_ids[-1] in params.all_stop_token_ids
+        )
+
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        draft = self._pending_draft_token_ids
+        self._pending_draft_token_ids = None
+        return draft
 
     def _build_chunked_prefill_output(
         self,
@@ -2645,6 +2846,14 @@ class TTModelRunner:
             "prompt_lens": model_input.prompt_lens,
             "start_pos": model_input.input_positions,
         }
+        from vllm_tt_plugin.prefix_resume import REGISTRY
+
+        if REGISTRY.active and model_input.intermediate_prefill_mask is not None:
+            # Exact prefix resume: the request of each row (the model asks the registry whether
+            # it was resumed) and the rows that end their prompt in this step.
+            rows = int(model_input.unpadded_batch_size)
+            kwargs["prefill_request_ids"] = list(self.input_batch.req_ids[:rows])
+            kwargs["prefill_final_rows"] = (~model_input.intermediate_prefill_mask[:rows]).tolist()
         # Hybrid attention models route per-layer block tables; the
         # runner already expanded ``block_tables_per_group`` into a
         # per-layer list at submission time when the kv_cache_config has
@@ -2714,6 +2923,25 @@ class TTModelRunner:
         tt_log_probs = None
 
         # Execute model
+        if is_decode and model_input.speculative:
+            # One speculative step: draft + verify on device (exact greedy, or lossless speculative
+            # sampling for a device-sampled request); the model returns the committed tokens.
+            request = model_input.exact_sampling[0] if model_input.exact_sampling else None
+            committed = self.model.speculative_step(
+                int(model_input.input_tokens[0, 0]),
+                int(model_input.input_positions[0]),
+                model_input.block_tables[0],
+                **({"request": request} if request is not None else {}),
+            )
+            return _SyncForward(
+                tt_out=("tt_speculative", committed),
+                tt_log_probs=None,
+                sampling_params=sampling_params,
+                model_input=model_input,
+                batch_size_per_dp=batch_size_per_dp,
+                perform_device_sampling=False,
+                is_decode=True,
+            )
         if not is_decode:
             tt_out = self.submit_prefill(model_input, batch_size_per_dp)
             # Prefill returns the raw model output: an optional

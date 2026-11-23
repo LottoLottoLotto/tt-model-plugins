@@ -470,6 +470,10 @@ def register_tt_models(register_test_models=False) -> None:
     # the unified arch (and its ``TT`` alias) to the same text-only TT class
     # so text-only inference runs on the unified checkpoint.
     _gemma4_target = "models.demos.gemma4.tt.generator_vllm:Gemma4ForCausalLM"
+    if os.environ.get("GEMMA4_SINGLE_USER") == "1":
+        # Single-user full-context runtime (ring sliding KV, chunked prefill,
+        # exact speculative decoding): models/demos/gemma4/tt/serving_vllm.py
+        _gemma4_target = "models.demos.gemma4.tt.serving_vllm:Gemma4SingleUserForCausalLM"
     for arch in (
         "Gemma4ForCausalLM",
         "Gemma4ForConditionalGeneration",
@@ -577,9 +581,21 @@ class TTPlatform(Platform):
 
         vllm_config.scheduler_config.disable_chunked_mm_input = True
 
-        assert not vllm_config.speculative_config, (
-            "Speculative decoding is not yet supported for TT backend"
-        )
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is not None:
+            # Only the model-owned exact greedy speculation of the single-user
+            # gemma-4 runtime: drafting and verification run inside the model
+            # (one device trace per step); the scheduler reserves the verify rows.
+            if speculative_config.method != "gemma4_assistant":
+                raise ValueError(
+                    "TT backend supports only speculative method gemma4_assistant"
+                )
+            if vllm_config.scheduler_config.max_num_seqs != 1:
+                raise ValueError("TT gemma4_assistant speculation requires max_num_seqs=1")
+            if vllm_config.scheduler_config.async_scheduling:
+                raise ValueError("TT gemma4_assistant speculation requires synchronous scheduling")
+            os.environ["GEMMA4_ASSISTANT_DIR"] = speculative_config.model
+            os.environ["GEMMA4_DRAFT_LEN"] = str(speculative_config.num_speculative_tokens)
         assert (
             vllm_config.parallel_config.tensor_parallel_size == 1
             and vllm_config.parallel_config.pipeline_parallel_size == 1
@@ -754,6 +770,9 @@ class TTPlatform(Platform):
                 else False
             )
 
+            exact_resume = bool(model_capabilities and model_capabilities.get("exact_prefix_resume"))
+            if speculative_config is not None and supports_prefix_caching and not exact_resume:
+                raise ValueError("TT gemma4_assistant speculation requires prefix caching off")
             if not supports_prefix_caching:
                 vllm_config.cache_config.enable_prefix_caching = False
                 logger.warning(
@@ -763,7 +782,8 @@ class TTPlatform(Platform):
                 )
             else:
                 # Check if the model architecture uses sliding window
-                uses_sliding_window = (
+                # Exact-prefix-resume models own their sliding-window state (prefix_resume.py).
+                uses_sliding_window = not exact_resume and (
                     vllm_config.model_config.get_sliding_window() is not None
                 )
                 if uses_sliding_window:
