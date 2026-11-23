@@ -656,7 +656,16 @@ class TTPlatform(Platform):
         speculative_config = vllm_config.speculative_config
         if speculative_config is None:
             os.environ["QWEN36_DFLASH"] = "0"
-        if speculative_config is not None:
+        if speculative_config is not None and speculative_config.method == "ngram":
+            # Model-owned prompt lookup (LFM2.5: the model's lookup_drafts / lookup_step): the runner proposes drafts
+            # from the request's own tokens and the model verifies them in one traced step (model_runner.py).
+            if vllm_config.scheduler_config.max_num_seqs != 1:
+                raise ValueError("TT prompt-lookup speculation owns one recurrent-state stream; max_num_seqs must be 1")
+            if not 1 <= speculative_config.num_speculative_tokens <= 7:
+                raise ValueError("TT prompt-lookup speculation verifies 1..7 drafts per step")
+            os.environ["QWEN36_DFLASH"] = "0"
+            os.environ["QWEN36_MTP"] = "0"
+        elif speculative_config is not None:
             is_dflash = speculative_config.method == "dflash"
             if is_dflash:
                 if speculative_config.num_speculative_tokens not in (3, 7):

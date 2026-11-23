@@ -140,13 +140,20 @@ class TTModelRunner:
             self.speculative_config is not None
             and self.speculative_config.method == "dflash"
         )
+        # Model-owned prompt lookup (speculative_config method "ngram"; LFM2.5): the model proposes 0..depth drafts
+        # from the request's own tokens (lookup_drafts) and verifies them (lookup_step).
+        self.lookup_enabled = (
+            self.speculative_config is not None
+            and self.speculative_config.method == "ngram"
+        )
         self.mtp_enabled = (
             self.speculative_config is not None
             and not self.dflash_enabled
+            and not self.lookup_enabled
             and os.environ.get("QWEN36_MTP") == "1"
         )
-        self.speculative_method = "dflash" if self.dflash_enabled else "mtp"
-        self.speculation_enabled = self.dflash_enabled or self.mtp_enabled
+        self.speculative_method = "dflash" if self.dflash_enabled else "ngram" if self.lookup_enabled else "mtp"
+        self.speculation_enabled = self.dflash_enabled or self.mtp_enabled or self.lookup_enabled
         self.speculative_depth = self.speculative_config.num_speculative_tokens if self.speculation_enabled else 0
         self._speculative_owner: str | None = None
         # req_id -> (request state object, history owner number, resolved 64-bit seed) for exact sampling.
@@ -308,9 +315,10 @@ class TTModelRunner:
         self.supports_exact_device_sampling = bool(
             capabilities.get("supports_exact_device_sampling", False) and exact is not None and exact()
         )
-        sampled_mtp = getattr(self.model, "sampled_mtp_available", None)
+        sampled = getattr(self.model, "sampled_speculation_available", None) or getattr(
+            self.model, "sampled_mtp_available", None)
         self.supports_sampled_speculation = bool(
-            self.supports_exact_device_sampling and sampled_mtp is not None and sampled_mtp()
+            self.supports_exact_device_sampling and sampled is not None and sampled()
         )
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
@@ -1204,13 +1212,16 @@ class TTModelRunner:
                 req_state = self.requests[req_id]
                 # Ownership is the scheduler's real list, never padded block_tables.
                 owned_pages = req_state.block_ids[0]
-                needed_pages = (position + self.speculative_depth) // self.cache_config.block_size + 1
-                if (len(drafts) == self.speculative_depth
+                # prompt lookup verifies any 1..depth drafts; MTP / DFlash exactly depth
+                depth = len(drafts) if self.lookup_enabled else self.speculative_depth
+                needed_pages = (position + depth) // self.cache_config.block_size + 1
+                if ((1 <= len(drafts) <= self.speculative_depth if self.lookup_enabled
+                        else len(drafts) == self.speculative_depth)
                         and all(0 <= t < self.vocab_size for t in drafts)
                         and len(owned_pages) >= needed_pages
-                        and num_sched[req_id] >= self.speculative_depth + 1
+                        and num_sched[req_id] >= depth + 1
                         and int(input_batch.num_computed_tokens_cpu[req_index]) == position
-                        and self._speculation_remaining(req_id) >= self.speculative_depth + 1
+                        and self._speculation_remaining(req_id) >= depth + 1
                         and self._speculation_context_fits(position)
                         and (not self.dflash_enabled or (
                             self._speculative_owner == req_id and self._dflash_context_valid
@@ -1442,12 +1453,16 @@ class TTModelRunner:
         )
 
     def _exact_sampling_request(self, req_id: str):
-        """A device_sampling.SamplingRequest for req_id, or None when the host sampler must handle it."""
+        """A device_sampling.SamplingRequest for req_id, or None when the host sampler must handle it. A model may
+        provide its own sampler rules: `exact_sampling_eligible(params, n_out)` and `exact_sampling_spec(params,
+        seed)` (else Qwen36's device_eligible / row_sampling)."""
         from models.demos.blackhole.qwen36.tt.device_sampling import SamplingRequest, device_eligible, row_sampling
 
+        eligible = getattr(self.model, "exact_sampling_eligible", device_eligible)
+        make_spec = getattr(self.model, "exact_sampling_spec", row_sampling)
         state = self.requests[req_id]
         params = state.sampling_params
-        if not device_eligible(params, len(state.output_token_ids)):
+        if not eligible(params, len(state.output_token_ids)):
             return None
         owner = self._exact_owners.get(req_id)
         if owner is None or owner[0] is not state:
@@ -1459,7 +1474,7 @@ class TTModelRunner:
             self._exact_owners[req_id] = owner
         return SamplingRequest(
             owner=owner[1],
-            spec=row_sampling(params, owner[2]),
+            spec=make_spec(params, owner[2]),
             outputs=state.output_token_ids,
             prompt=state.prompt_token_ids if params.repetition_penalty != 1.0 else None,
         )
@@ -2640,7 +2655,7 @@ class TTModelRunner:
             and sampled_token_ids.shape[0] == 1
             and self.input_batch.num_reqs == 1
             and self._speculation_context_fits(int(self.input_batch.num_tokens[0]) - 1)
-            and self._speculation_remaining(self.input_batch.req_ids[0]) >= self.speculative_depth + 1
+            and self._speculation_remaining(self.input_batch.req_ids[0]) >= self._speculation_min_remaining()
             and not self._speculation_stopped(self.input_batch.req_ids[0])
             and (not self.dflash_enabled or (
                 not fwd.is_decode and self._dflash_context_valid
@@ -2653,7 +2668,9 @@ class TTModelRunner:
         if speculate:
             first_token = int(sampled_token_ids.reshape(-1)[0])
             position = int(self.input_batch.num_tokens[0]) - 1
-            if self.dflash_enabled:
+            if self.lookup_enabled:
+                drafts = self._lookup_drafts(self.input_batch.req_ids[0])
+            elif self.dflash_enabled:
                 drafts = self.model.dflash_first_drafts(first_token, position)
             elif spec_request is not None:
                 drafts = self.model.mtp_first_drafts(first_token, position, request=spec_request)
@@ -2661,11 +2678,12 @@ class TTModelRunner:
                 drafts = self.model.mtp_first_drafts(first_token, position)
             req_id = self.input_batch.req_ids[0]
             self._speculative_owner = req_id
-            if len(drafts) == self.speculative_depth:
+            if self._drafts_usable(drafts):
                 self._pending_draft_token_ids = DraftTokenIds([req_id], [drafts])
         if (self.speculation_enabled and self.input_batch.num_reqs == 1
                 and self._speculation_stopped(self.input_batch.req_ids[0])):
             self._reset_speculation()
+        self._lookup_clear_placeholders()
         return out
 
     def _finish_speculative(self, fwd: _SyncForward) -> ModelRunnerOutput:
@@ -2683,10 +2701,13 @@ class TTModelRunner:
         if self._speculation_stopped(req_id):
             self._reset_speculation()
         elif (self._speculation_context_fits(int(self.input_batch.num_tokens[0]) - 1)
-                and self._speculation_remaining(req_id) >= self.speculative_depth + 1
-                and len(next_drafts) == self.speculative_depth
+                and self._speculation_remaining(req_id) >= self._speculation_min_remaining()
                 and (not self.dflash_enabled or self._dflash_context_valid)):
-            self._pending_draft_token_ids = DraftTokenIds([req_id], [next_drafts])
+            if self.lookup_enabled:
+                next_drafts = self._lookup_drafts(req_id)
+            if self._drafts_usable(next_drafts):
+                self._pending_draft_token_ids = DraftTokenIds([req_id], [next_drafts])
+        self._lookup_clear_placeholders()
         num_reqs = self.input_batch.num_reqs
         output_req_ids = list(self.input_batch.req_ids[:num_reqs])
         return ModelRunnerOutput(
@@ -2697,6 +2718,35 @@ class TTModelRunner:
             prompt_logprobs_dict=dict.fromkeys(output_req_ids, None),
             pooler_output=[],
         )
+
+    def _lookup_clear_placeholders(self) -> None:
+        """Prompt lookup: a request without drafts gets an explicit empty list.  (The TT scheduler, an
+        AsyncScheduler, leaves [-1] * depth placeholder drafts on every scheduled request; kept, they would schedule
+        depth + 1 tokens for what is a plain decode step.)"""
+        if self.lookup_enabled and self._pending_draft_token_ids is None:
+            req_ids = list(self.input_batch.req_ids[: self.input_batch.num_reqs])
+            if req_ids:
+                self._pending_draft_token_ids = DraftTokenIds(req_ids, [[] for _ in req_ids])
+
+    def _speculation_min_remaining(self) -> int:
+        """Tokens a request must still be allowed to produce for a speculative step (prompt lookup: >= 1 draft)."""
+        return 2 if self.lookup_enabled else self.speculative_depth + 1
+
+    def _drafts_usable(self, drafts) -> bool:
+        if self.lookup_enabled:
+            return bool(drafts)
+        return drafts is not None and len(drafts) == self.speculative_depth
+
+    def _lookup_drafts(self, req_id: str) -> list[int]:
+        """The model's prompt-lookup drafts for req_id's next step ([]: the plain decode step runs)."""
+        state = self.requests[req_id]
+        max_drafts = min(self.speculative_depth, self._speculation_remaining(req_id) - 1)
+        if max_drafts <= 0:
+            return []
+        cfg = self.speculative_config
+        return [int(t) for t in self.model.lookup_drafts(
+            (req_id, id(state)), state.prompt_token_ids, state.output_token_ids, max_drafts,
+            cfg.prompt_lookup_min, cfg.prompt_lookup_max)]
 
     def _speculation_context_fits(self, position: int) -> bool:
         limit = self.model_config.max_model_len
@@ -3024,7 +3074,8 @@ class TTModelRunner:
             # decode consumes the committed token and position.
             self._decode_layout_changed_since_last_decode = True
             _t0 = time.perf_counter()
-            step = self.model.dflash_step if self.dflash_enabled else self.model.mtp_step
+            step = (self.model.lookup_step if self.lookup_enabled
+                    else self.model.dflash_step if self.dflash_enabled else self.model.mtp_step)
             step_kwargs = {"request": spec[1]} if spec[1] is not None else {}
             emitted, next_drafts = step(
                 int(model_input.input_tokens[0, 0]),
