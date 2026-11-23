@@ -130,3 +130,4 @@ class TTModelInput:
     # Prefill-only: rows whose forward contributes KV state but must not
     # consume a sampling RNG draw because more prompt tokens remain.
     intermediate_prefill_mask: torch.Tensor | None = None
+    mtp_draft: int | None = None

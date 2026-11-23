@@ -328,6 +328,9 @@ class TTWorker(WorkerBase):
             elapsed = time.perf_counter() - start
         return CompilationTimes(language_model=elapsed, encoder=0.0)
 
+    def take_draft_token_ids(self):
+        return self.model_runner.take_draft_token_ids()
+
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
