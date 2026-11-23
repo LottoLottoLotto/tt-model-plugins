@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import ClassVar
@@ -10,6 +11,10 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.request import Request
 from vllm_tt_plugin.logger import init_tt_logger
+from vllm_tt_plugin.prefix_resume import REGISTRY
+
+# The optimized Qwen 27B runtime's prefill chunk: multi-user serving splits long prompts on its boundaries.
+QWEN_PREFILL_CHUNK = 2048
 
 logger = init_tt_logger(__name__)
 
@@ -120,6 +125,21 @@ class TTScheduler(AsyncScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._forced_mode = TTSchedulingMode.DEFAULT
+        if self.cache_config.enable_prefix_caching:
+            # Prefix hits come from exact model-side resume snapshots, not raw block hashes.
+            REGISTRY.attach(self.kv_cache_manager)
+        # Optimized Qwen 27B with several users (platform.py): while users decode, every prefill step
+        # processes at most one model chunk, every intermediate chunk ends on a chunk boundary (where the
+        # model resumes exactly), and a decode step of the running users follows each prefill step.
+        self._interleave_chunk = (
+            QWEN_PREFILL_CHUNK
+            if os.environ.get("QWEN36_OPTIMIZED_27B") == "1" and self.scheduler_config.max_num_seqs > 1
+            and self.scheduler_config.enable_chunked_prefill
+            else 0
+        )
+        if self._interleave_chunk:
+            self.need_mamba_block_aligned_split = True
+        self._last_step_prefill = False
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
@@ -153,20 +173,42 @@ class TTScheduler(AsyncScheduler):
         # Default mode:
         # Prefer prefill whenever there is pending prefill work - either new
         # requests in the waiting queue or partial-prefill continuations in
-        # the running list.
-        if has_pending_prefill:
+        # the running list. With interleaving, a prefill step is followed by a
+        # decode step whenever requests are decoding.
+        interleave_decode = self._interleave_chunk and self._last_step_prefill and has_running
+        if has_pending_prefill and not interleave_decode:
             prefill_result = self._schedule_prefill_only()
             # If prefill cannot make progress (e.g., KV pressure) but running
             # decode requests exist, fall back to decode-only so they can
             # advance and free capacity.
             if prefill_result.total_num_scheduled_tokens == 0 and has_running:
                 result = self._schedule_decode_only()
+                self._last_step_prefill = False
                 return self._finalize_scheduler_output(result)
+            self._last_step_prefill = prefill_result.total_num_scheduled_tokens > 0
             return self._finalize_scheduler_output(prefill_result)
+        self._last_step_prefill = False
+        if has_pending_prefill:
+            result = self._schedule_decode_only()
+            return self._finalize_scheduler_output(result)
 
         # No pending prefill work: run decode-only naturally.
         result = super().schedule()
         return self._finalize_scheduler_output(result)
+
+    def _mamba_block_aligned_split(self, request: Request, num_new_tokens: int,
+                                   num_new_local_computed_tokens: int = 0,
+                                   num_external_computed_tokens: int = 0) -> int:
+        """Interleaved Qwen prefill: an intermediate chunk ends on a model chunk boundary."""
+        if not self._interleave_chunk:
+            return super()._mamba_block_aligned_split(
+                request, num_new_tokens, num_new_local_computed_tokens, num_external_computed_tokens
+            )
+        computed = request.num_computed_tokens + num_new_local_computed_tokens + num_external_computed_tokens
+        end = computed + num_new_tokens
+        if end >= request.num_tokens:
+            return num_new_tokens  # finishes the known tokens (a whole prompt tail, or a decode token)
+        return max(0, end // self._interleave_chunk * self._interleave_chunk - computed)
 
     def _finalize_scheduler_output(
         self, scheduler_output: SchedulerOutput
@@ -185,13 +227,18 @@ class TTScheduler(AsyncScheduler):
         partial_prefills = [r for r in self.running if r.is_prefill_chunk]
 
         saved_max = self.max_num_running_reqs
+        saved_budget = self.max_num_scheduled_tokens
         self.running = partial_prefills
         self.max_num_running_reqs = max(0, saved_max - len(pure_decodes))
+        if self._interleave_chunk and pure_decodes:
+            # One model chunk of prefill between two decode steps of the running users.
+            self.max_num_scheduled_tokens = min(saved_budget, self._interleave_chunk)
         try:
             result = super().schedule()
         finally:
             self.running.extend(pure_decodes)
             self.max_num_running_reqs = saved_max
+            self.max_num_scheduled_tokens = saved_budget
         return result
 
     def _schedule_decode_only(self) -> SchedulerOutput:

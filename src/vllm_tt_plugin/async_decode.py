@@ -581,7 +581,9 @@ class TTAsyncDecodeController:
         # kwarg.
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
-        if perform_device_sampling:
+        if model_input.exact_sampling is not None:
+            kwargs["exact_sampling"] = model_input.exact_sampling
+        elif perform_device_sampling:
             sampling_param_dict = {
                 field.name: (
                     getattr(sampling_params, field.name).tolist()
