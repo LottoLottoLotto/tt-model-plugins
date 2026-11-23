@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
+    DraftTokenIds,
     EMPTY_MODEL_RUNNER_OUTPUT,
     LogprobsLists,
     LogprobsTensors,
@@ -70,6 +71,8 @@ from vllm_tt_plugin.structured_output import (
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
+import os
+import time
 import numpy as np
 
 logger = init_tt_logger(__name__)
@@ -132,6 +135,10 @@ class TTModelRunner:
         self.parallel_config = vllm_config.parallel_config
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
+        # TT MTP-1: device-resident verify/commit/draft cycle (Qwen3.5). One request at a time.
+        self.mtp_enabled = self.speculative_config is not None and os.environ.get("QWEN36_MTP") == "1"
+        self._pending_draft_token_ids: DraftTokenIds | None = None
+        self._mtp_draft_for_req: dict[str, int] = {}
         self.observability_config = vllm_config.observability_config
         self.device_config = vllm_config.device_config
 
@@ -161,6 +168,10 @@ class TTModelRunner:
         self.supports_topk_logprobs = (
             self.model_config.hf_config.model_type == "gpt_oss"
         )
+        # Populated from the loaded TT model's capability metadata. Models may
+        # expose a single-device force-argmax path without supporting random
+        # sampling or penalties at that vocabulary width.
+        self.supports_greedy_only_sample_on_device = False
 
         logger.info(
             "TTModelRunner: trace_mode=%s, "
@@ -266,6 +277,10 @@ class TTModelRunner:
         loader = TTModelLoader(self.load_config)
         self.model = loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
+        )
+        capabilities = getattr(self.model, "model_capabilities", {})
+        self.supports_greedy_only_sample_on_device = bool(
+            capabilities.get("supports_greedy_only_sample_on_device", False)
         )
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
@@ -1129,6 +1144,12 @@ class TTModelRunner:
                 req_indices, positions_np
             ].view(-1, 1)
             prompt_lens = None
+            scheduled_drafts = scheduler_output.scheduled_spec_decode_tokens
+            mtp_draft = None
+            if self.mtp_enabled and len(req_indices) == 1:
+                drafts = [int(t) for t in scheduled_drafts.get(input_batch.req_ids[req_indices[0]], ()) if int(t) >= 0]
+                if len(drafts) == 1:
+                    mtp_draft = drafts[0]
             # For on-device decode sampling, tell the backend if the padded
             # decode batch layout changed since the previous step.
             reset_batch = self._decode_layout_changed_since_last_decode
@@ -1341,6 +1362,7 @@ class TTModelRunner:
             # state. Stateless models ignore it.
             prefill_empty_slots=prefill_empty_slots,
             intermediate_prefill_mask=intermediate_prefill_mask,
+            mtp_draft=(mtp_draft if not is_prompt else None),
         )
 
     def build_model_input(
@@ -2454,6 +2476,8 @@ class TTModelRunner:
             return self.apply_and_build_runner_output(
                 torch.tensor([], dtype=torch.int32), None
             )
+        if isinstance(fwd.tt_out, tuple) and fwd.tt_out and fwd.tt_out[0] == "tt_mtp":
+            return self._finish_mtp(fwd)
         fwd = replace(
             fwd,
             model_input=self._apply_grammar_to_input(
@@ -2480,7 +2504,51 @@ class TTModelRunner:
                     intermediate_mask=intermediate_mask,
                 )
 
-        return self.apply_and_build_runner_output(sampled_token_ids, logprobs)
+        out = self.apply_and_build_runner_output(sampled_token_ids, logprobs)
+        if (
+            self.mtp_enabled
+            and sampled_token_ids.shape[0] == 1
+            and self.input_batch.num_reqs == 1
+            and self.input_batch.all_greedy
+            and self.check_perform_device_sampling(
+                is_decode=True,
+                has_structured_outputs=any(
+                    mask is not None for mask in fwd.model_input.grammar_bitmask
+                ),
+            )
+        ):
+            # Use the model-owned first draft only for unconstrained device sampling.
+            first_token = int(sampled_token_ids.reshape(-1)[0])
+            position = int(self.input_batch.num_tokens[0]) - 1  # first_token sits at the last filled index
+            if os.environ.get("QWEN36_MTP_TRACE") == "1":
+                logger.info("MTP first draft: token=%d position=%d num_tokens=%d", first_token, position, int(self.input_batch.num_tokens[0]))
+            draft = self.model.mtp_first_draft(first_token, position)
+            if draft is not None:
+                self._pending_draft_token_ids = DraftTokenIds([self.input_batch.req_ids[0]], [[draft]])
+        return out
+
+    def _finish_mtp(self, fwd: _SyncForward) -> ModelRunnerOutput:
+        _, emitted, next_draft = fwd.tt_out
+        req_id = self.input_batch.req_ids[0]
+        # Apply committed tokens to runner state one at a time (state helper is 1-token).
+        for tok in emitted:
+            self._apply_sampled_tokens_to_state(torch.tensor([[tok]], dtype=torch.int32))
+        self._pending_draft_token_ids = DraftTokenIds([req_id], [[int(next_draft)]])
+        num_reqs = self.input_batch.num_reqs
+        output_req_ids = list(self.input_batch.req_ids[:num_reqs])
+        return ModelRunnerOutput(
+            req_ids=output_req_ids,
+            req_id_to_index={r: i for i, r in enumerate(output_req_ids)},
+            sampled_token_ids=[[int(t) for t in emitted]],
+            logprobs=None,
+            prompt_logprobs_dict=dict.fromkeys(output_req_ids, None),
+            pooler_output=[],
+        )
+
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        draft = self._pending_draft_token_ids
+        self._pending_draft_token_ids = None
+        return draft
 
     def _build_chunked_prefill_output(
         self,
@@ -2590,6 +2658,15 @@ class TTModelRunner:
 
         # Calculate number of devices per DP rank
         num_devices = self.num_devices // self.tt_data_parallel_size
+        if (
+            num_devices == 1
+            and self.supports_greedy_only_sample_on_device
+            and (
+                not self.input_batch.all_greedy
+                or not self.input_batch.no_penalties
+            )
+        ):
+            return False
 
         # Always host-only sampling params: min_p, bad_words, logit_bias,
         # allowed_token_ids, min_tokens require host sampling.
@@ -2727,6 +2804,34 @@ class TTModelRunner:
                 tt_out, tt_log_probs = tt_out
             elif isinstance(tt_out, tuple):
                 tt_out, _ = tt_out
+        elif (
+            self.mtp_enabled
+            and getattr(model_input, "mtp_draft", None) is not None
+            and self.input_batch.all_greedy
+            and perform_device_sampling
+        ):
+            _t0 = time.perf_counter()
+            emitted, next_draft = self.model.mtp_step(
+                int(model_input.input_tokens[0, 0]),
+                int(model_input.mtp_draft),
+                int(model_input.input_positions[0]),
+                model_input.block_tables[0],
+            )
+            self._mtp_stats = getattr(self, "_mtp_stats", {"cycles": 0, "accepted": 0, "ms": 0.0})
+            self._mtp_stats["cycles"] += 1
+            self._mtp_stats["accepted"] += int(len(emitted) == 2)
+            self._mtp_stats["ms"] += (time.perf_counter() - _t0) * 1000
+            if self._mtp_stats["cycles"] % 32 == 0:
+                logger.info("TT MTP stats cycles=%d accepted=%d mean_cycle_ms=%.3f", self._mtp_stats["cycles"], self._mtp_stats["accepted"], self._mtp_stats["ms"] / self._mtp_stats["cycles"])
+            return _SyncForward(
+                tt_out=("tt_mtp", emitted, next_draft),
+                tt_log_probs=None,
+                sampling_params=sampling_params,
+                model_input=model_input,
+                batch_size_per_dp=batch_size_per_dp,
+                perform_device_sampling=False,
+                is_decode=True,
+            )
         else:
             submission = self.async_decode.submit_decode(
                 model_input, read_from_device=False, async_read=False

@@ -577,9 +577,14 @@ class TTPlatform(Platform):
 
         vllm_config.scheduler_config.disable_chunked_mm_input = True
 
-        assert not vllm_config.speculative_config, (
-            "Speculative decoding is not yet supported for TT backend"
-        )
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is not None:
+            assert os.environ.get("QWEN36_MTP") == "1", (
+                "TT speculative decoding requires QWEN36_MTP=1 (Qwen3.5 MTP-1 device cycle)"
+            )
+            assert speculative_config.num_speculative_tokens == 1, (
+                "TT Qwen3.5 MTP supports exactly one speculative token"
+            )
         assert (
             vllm_config.parallel_config.tensor_parallel_size == 1
             and vllm_config.parallel_config.pipeline_parallel_size == 1
