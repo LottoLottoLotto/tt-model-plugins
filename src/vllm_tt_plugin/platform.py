@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import ast
 import json
 import os
 import sys
@@ -46,11 +47,49 @@ _GALAXY_GENERATOR_VERSIONS = {
 _CHUNKED_PREFILL_MODEL_TYPES = {"gemma4", "gemma4_unified"}
 
 
-def _apply_chunked_prefill_policy(vllm_config: "VllmConfig") -> None:
-    """Restricts token-chunked prefill to model types Metal has validated."""
+def _apply_chunked_prefill_policy(
+    vllm_config: "VllmConfig", model_capabilities: dict | None = None
+) -> None:
+    """Enable resumable Qwen prefill only for one device with multiple slots."""
     scheduler_config = vllm_config.scheduler_config
     model_config = vllm_config.model_config
     model_type = getattr(model_config.hf_config, "model_type", None)
+
+    qwen_batched = False
+    if (
+        (model_capabilities or {}).get("supports_chunked_prefill_single_device_batched", False)
+        and scheduler_config.max_num_seqs > 1
+        and get_tt_data_parallel_size(vllm_config) == 1
+    ):
+        # This runs in the API process. Device enumeration acquires the UMD
+        # chip lock there and deadlocks the worker that must own the device.
+        # Match worker.get_mesh_grid's environment syntax without importing
+        # the worker or touching the runtime.
+        mesh = os.environ.get("MESH_DEVICE")
+        if mesh is None:
+            raise ValueError(
+                "Set MESH_DEVICE for batched Qwen serving (e.g. P150 or '(1, 1)'); "
+                "device discovery must run only in the worker."
+            )
+        qwen_batched = mesh in {"N150", "P100", "P150"}
+        if not qwen_batched:
+            try:
+                qwen_batched = ast.literal_eval(mesh) == (1, 1)
+            except (ValueError, SyntaxError):
+                pass
+    # Like the resolved lane count, keep this platform-derived policy in a
+    # declared config field so the engine and worker receive the same decision.
+    if vllm_config.additional_config is None:
+        vllm_config.additional_config = {}
+    vllm_config.additional_config["_tt_qwen_batched_prefill"] = qwen_batched
+    if qwen_batched:
+        scheduler_config.enable_chunked_prefill = True
+        scheduler_config.max_num_batched_tokens = max(
+            scheduler_config.max_num_seqs,
+            min(2048, max(128, scheduler_config.max_num_batched_tokens)),
+        )
+        scheduler_config.long_prefill_token_threshold = 2048
+        return
 
     if model_type not in _CHUNKED_PREFILL_MODEL_TYPES:
         if scheduler_config.enable_chunked_prefill:
@@ -407,6 +446,11 @@ def register_tt_models(register_test_models=False) -> None:
         "TTQwen3_5ForConditionalGeneration",
         "models.demos.blackhole.qwen36.tt.qwen36_vllm:Qwen36ForCausalLM",
     )
+    _register_model_if_missing(
+        ModelRegistry,
+        "TTQwen3_5MoeForConditionalGeneration",
+        "models.demos.blackhole.qwen36.tt.qwen36_vllm:Qwen36ForCausalLM",
+    )
 
     # Qwen2.5 - Vision
     _register_model_if_missing(
@@ -525,6 +569,38 @@ def register_tt_test_models():
     )
 
 
+def _install_tt_model_owned_state_patch() -> None:
+    """Keep vLLM's Mamba cache bookkeeping off for TT hybrid models.
+
+    TT hybrid (GDN/Mamba-style) models own their recurrent state on device and
+    register only attention KV with vLLM, so vLLM's Mamba prefix-cache modes
+    ('align'/'all', which require scheduler token chunking and forbid
+    speculation) do not apply: a TT model that supports prefix caching resumes
+    its own state (prefix_resume.py). Run vLLM's hybrid config updates as if
+    prefix caching were off -- the configuration TT hybrid models are served
+    with today -- while leaving prefix caching itself requested.
+    """
+    from vllm.model_executor.models import config as model_configs
+
+    for cls in (model_configs.MambaModelConfig, model_configs.HybridAttentionMambaModelConfig):
+        original = cls.__dict__["verify_and_update_config"].__func__
+        if getattr(original, "_tt_model_owned_state", False):
+            continue
+
+        def verify_and_update_config(klass, vllm_config, _original=original):
+            cache_config = vllm_config.cache_config
+            requested = cache_config.enable_prefix_caching
+            cache_config.enable_prefix_caching = False
+            try:
+                _original(klass, vllm_config)
+            finally:
+                cache_config.enable_prefix_caching = requested
+
+        verify_and_update_config._tt_model_owned_state = True
+        cls.verify_and_update_config = classmethod(verify_and_update_config)
+
+
+
 class TTPlatform(Platform):
     _enum = PlatformEnum.OOT
     device_name: str = "tt"
@@ -554,6 +630,7 @@ class TTPlatform(Platform):
         # when explicitly requested via CLI override.
         super().pre_register_and_update(parser)
         _install_tt_harmony_truncation_patch()
+        _install_tt_model_owned_state_patch()
         if _should_pre_register_tt_test_models_from_cli():
             register_tt_test_models()
 
@@ -573,13 +650,74 @@ class TTPlatform(Platform):
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         _install_tt_harmony_truncation_patch()
-        _apply_chunked_prefill_policy(vllm_config)
 
         vllm_config.scheduler_config.disable_chunked_mm_input = True
 
-        assert not vllm_config.speculative_config, (
-            "Speculative decoding is not yet supported for TT backend"
-        )
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is None:
+            os.environ["QWEN36_DFLASH"] = "0"
+        if speculative_config is not None:
+            is_dflash = speculative_config.method == "dflash"
+            if is_dflash:
+                if speculative_config.num_speculative_tokens not in (3, 7):
+                    raise ValueError("TT DFlash supports depths 3 and 7")
+                if not speculative_config.model:
+                    raise ValueError("TT DFlash requires the actual drafter checkpoint path")
+                os.environ["QWEN36_DFLASH"] = "1"
+                os.environ["QWEN36_DFLASH_MODEL"] = speculative_config.model
+                os.environ["QWEN36_DFLASH_BLOCK_SIZE"] = str(speculative_config.num_speculative_tokens + 1)
+                os.environ["QWEN36_MTP"] = "0"
+                if vllm_config.parallel_config.data_parallel_size != 1:
+                    raise ValueError("TT DFlash requires a single device")
+                if vllm_config.scheduler_config.async_scheduling:
+                    raise ValueError("TT DFlash requires synchronous scheduling")
+                if vllm_config.cache_config.kv_sharing_fast_prefill or vllm_config.kv_transfer_config is not None:
+                    raise ValueError("TT DFlash requires locally computed full target features")
+                # The target chunks a complete request internally; scheduler
+                # token chunks cannot rebuild its recurrent state or tap history.
+                vllm_config.scheduler_config.enable_chunked_prefill = False
+                vllm_config.scheduler_config.long_prefill_token_threshold = 0
+                vllm_config.scheduler_config.max_num_batched_tokens = max(
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    vllm_config.model_config.max_model_len,
+                )
+            else:
+                assert os.environ.get("QWEN36_MTP") == "1", (
+                    "TT speculative decoding requires QWEN36_MTP=1"
+                )
+                if speculative_config.num_speculative_tokens not in (1, 2, 3):
+                    raise ValueError("TT Qwen MTP supports depths 1, 2, and 3")
+                os.environ["QWEN36_DFLASH"] = "0"
+                os.environ["QWEN36_MTP_DEPTH"] = str(speculative_config.num_speculative_tokens)
+            hf = vllm_config.model_config.hf_config
+            text = getattr(hf, "text_config", hf)
+            geometry = (
+                getattr(text, "hidden_size", None),
+                getattr(text, "linear_num_key_heads", None),
+                getattr(text, "linear_num_value_heads", None),
+                getattr(text, "linear_key_head_dim", None),
+                getattr(text, "linear_value_head_dim", None),
+                getattr(text, "linear_conv_kernel_dim", None),
+                getattr(text, "num_attention_heads", None),
+                getattr(text, "num_key_value_heads", None),
+                getattr(text, "head_dim", None),
+            )
+            if geometry not in (
+                (2048, 16, 32, 128, 128, 4, 16, 2, 256),
+                (4096, 16, 32, 128, 128, 4, 16, 4, 256),
+                (5120, 16, 48, 128, 128, 4, 24, 4, 256),
+            ):
+                raise ValueError(f"TT speculative verify/commit kernels do not support geometry {geometry}")
+            if is_dflash and geometry[0] != 5120:
+                raise ValueError("TT DFlash requires the validated 27B geometry")
+            if not is_dflash and speculative_config.num_speculative_tokens > 1 and geometry[0] != 5120:
+                raise ValueError("Wider TT MTP requires the validated 27B geometry")
+            if os.environ.get("QWEN36_GENERIC_BASELINE") == "1":
+                raise ValueError("TT speculation requires native BF16 row-major L1 GDN state")
+            if geometry[0] == 5120 and os.environ.get("QWEN36_OPTIMIZED_27B") != "1":
+                raise ValueError("27B speculation requires QWEN36_OPTIMIZED_27B=1")
+            if vllm_config.scheduler_config.max_num_seqs != 1:
+                raise ValueError("TT speculation owns one recurrent-state stream; max_num_seqs must be 1")
         assert (
             vllm_config.parallel_config.tensor_parallel_size == 1
             and vllm_config.parallel_config.pipeline_parallel_size == 1
@@ -607,6 +745,18 @@ class TTPlatform(Platform):
         # may be inspected (e.g. multimodal processor cache init) before this
         # `check_and_update_config()` hook is reached in that process.
         tt_config = get_tt_config(vllm_config)
+        if os.environ.get("QWEN36_OPTIMIZED_27B") == "1":
+            execution = tt_config or {}
+            trace_mode = execution.get("trace_mode", "all")
+            if trace_mode not in ("all", "none"):
+                raise ValueError(
+                    "Optimized 27B requires trace_mode=all or none: decode_only permits "
+                    "request-length prefill compilation while a decode trace is parked"
+                )
+            if not execution.get("enable_model_warmup", True):
+                raise ValueError("Optimized 27B requires complete prefill/decode/MTP program warmup")
+            if vllm_config.model_config.max_model_len > 8192 or vllm_config.scheduler_config.max_num_seqs != 1:
+                raise ValueError("Optimized 27B serving supports context <=8192 and batch 1")
         register_test_models = False
         if tt_config and "register_test_models" in tt_config:
             register_test_models = tt_config["register_test_models"]
@@ -691,6 +841,12 @@ class TTPlatform(Platform):
         model_capabilities: dict | None = getattr(
             model_class, "model_capabilities", None
         )
+        _apply_chunked_prefill_policy(vllm_config, model_capabilities)
+        if vllm_config.additional_config.get("_tt_qwen_batched_prefill", False):
+            # The concurrent target returns ordinary per-row vocabulary logits.
+            # Keep random sampling, penalties and logprobs on vLLM's host path.
+            sample_on_device_mode = None
+            cls.sample_on_device_mode = None
 
         # A model either supports the full on-device sampling pipeline or it
         # doesn't — there is no greedy-only mode. Models opt in by setting

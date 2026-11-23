@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
+    DraftTokenIds,
     EMPTY_MODEL_RUNNER_OUTPUT,
     LogprobsLists,
     LogprobsTensors,
@@ -70,6 +71,8 @@ from vllm_tt_plugin.structured_output import (
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
+import os
+import time
 import numpy as np
 
 logger = init_tt_logger(__name__)
@@ -132,6 +135,27 @@ class TTModelRunner:
         self.parallel_config = vllm_config.parallel_config
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
+        # Device-resident verify/commit/draft cycle; one active request.
+        self.dflash_enabled = (
+            self.speculative_config is not None
+            and self.speculative_config.method == "dflash"
+        )
+        self.mtp_enabled = (
+            self.speculative_config is not None
+            and not self.dflash_enabled
+            and os.environ.get("QWEN36_MTP") == "1"
+        )
+        self.speculative_method = "dflash" if self.dflash_enabled else "mtp"
+        self.speculation_enabled = self.dflash_enabled or self.mtp_enabled
+        self.speculative_depth = self.speculative_config.num_speculative_tokens if self.speculation_enabled else 0
+        self._speculative_owner: str | None = None
+        # req_id -> (request state object, history owner number, resolved 64-bit seed) for exact sampling.
+        self._exact_owners: dict[str, tuple[Any, int, int]] = {}
+        self._exact_owner_counter = 0
+        self.supports_exact_device_sampling = False
+        self.supports_sampled_speculation = False
+        self._dflash_context_valid = False
+        self._pending_draft_token_ids: DraftTokenIds | None = None
         self.observability_config = vllm_config.observability_config
         self.device_config = vllm_config.device_config
 
@@ -161,6 +185,10 @@ class TTModelRunner:
         self.supports_topk_logprobs = (
             self.model_config.hf_config.model_type == "gpt_oss"
         )
+        # Populated from the loaded TT model's capability metadata. Models may
+        # expose a single-device force-argmax path without supporting random
+        # sampling or penalties at that vocabulary width.
+        self.supports_greedy_only_sample_on_device = False
 
         logger.info(
             "TTModelRunner: trace_mode=%s, "
@@ -216,6 +244,9 @@ class TTModelRunner:
         # RNG, decode trace buffers). Needed because evict/re-add and condense move a
         # request's ROW, not its state.
         self._req_state_slot: dict[str, int] = {}
+        # Includes recomputation after preemption, which can extend beyond the
+        # original prompt into previously generated tokens.
+        self._prefilling_req_ids: set[str] = set()
 
         # Sampler for sampling on host when device sampling is not supported.
         # Only used by device ranks (local dp rank 0).
@@ -266,6 +297,20 @@ class TTModelRunner:
         loader = TTModelLoader(self.load_config)
         self.model = loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
+        )
+        capabilities = getattr(self.model, "model_capabilities", {})
+        self.supports_greedy_only_sample_on_device = bool(
+            capabilities.get("supports_greedy_only_sample_on_device", False)
+        )
+        # Exact vLLM-equivalent device sampling (penalties, temperature, min_p, top-k, top-p; counter-based RNG):
+        # decode rows of eligible requests and, for one sequence, sampled MTP verification.
+        exact = getattr(self.model, "exact_sampling_available", None)
+        self.supports_exact_device_sampling = bool(
+            capabilities.get("supports_exact_device_sampling", False) and exact is not None and exact()
+        )
+        sampled_mtp = getattr(self.model, "sampled_mtp_available", None)
+        self.supports_sampled_speculation = bool(
+            self.supports_exact_device_sampling and sampled_mtp is not None and sampled_mtp()
         )
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
@@ -613,6 +658,14 @@ class TTModelRunner:
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
+        dead = set(scheduler_output.finished_req_ids) | set(scheduler_output.preempted_req_ids or ())
+        for req_id in scheduler_output.finished_req_ids:
+            self._exact_owners.pop(req_id, None)
+        if self._speculative_owner in dead:
+            self._reset_speculation()
+        elif (self._pending_draft_token_ids is not None
+                and dead.intersection(self._pending_draft_token_ids.req_ids)):
+            self._pending_draft_token_ids = None
         self._release_dead_state_slots(scheduler_output)
 
         # Remove the finished requests from the persistent batch.
@@ -640,6 +693,8 @@ class TTModelRunner:
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
         cached_req_ids = self.input_batch.req_id_to_index.keys()
         unscheduled_req_ids = cached_req_ids - scheduled_req_ids
+        if self._speculative_owner in unscheduled_req_ids:
+            self._reset_speculation()
         # NOTE(woosuk): The persistent batch optimization assumes that
         # consecutive batches contain mostly the same requests. If batches
         # have low request overlap (e.g., alternating between two distinct
@@ -833,32 +888,34 @@ class TTModelRunner:
         """
         for req_id in scheduler_output.finished_req_ids:
             self._req_state_slot.pop(req_id, None)
+            self._prefilling_req_ids.discard(req_id)
         for req_id in scheduler_output.preempted_req_ids or ():
             self._req_state_slot.pop(req_id, None)
+            self._prefilling_req_ids.discard(req_id)
 
     def _alloc_prefill_state_slots(self, row_req_ids: list[str]) -> list[int]:
-        """Pick each prefilling request's state slot, skipping slots that live
-        off-batch requests own. Prefers its own row (where it decodes), so the
-        steady state moves nothing.
+        """Retain continuation slots and reserve every live owner before allocation.
 
-        Exhaustion is unreachable: holders and prefills are disjoint and both count
-        against ``max_num_seqs``, which is ``n_slots``. Reaching an assert means the
-        map has stopped describing the device, and nothing on the host can recover
-        it, so fail rather than guess and return plausible, wrong text.
+        Input rows can change between chunks and after a decode remap. A resumed
+        prefill must read its current device slot, not whichever row it happens
+        to occupy in this batch. Fresh prefills may reuse only unowned slots.
         """
         n_slots = self.tt_per_lane_max_num_seqs
         assert len(row_req_ids) <= n_slots, (
             f"{len(row_req_ids)} prefill(s) exceed the {n_slots} device state "
             "slots; admission is the scheduler's job, not this function's"
         )
-        prefilling = set(row_req_ids)
         held = {
             slot
             for req_id, slot in self._req_state_slot.items()
-            if req_id not in prefilling and req_id in self.requests
+            if req_id in self.requests
         }
         slots: list[int] = []
         for row, req_id in enumerate(row_req_ids):
+            slot = self._req_state_slot.get(req_id)
+            if slot is not None:
+                slots.append(slot)
+                continue
             if row not in held:
                 slot = row
             else:
@@ -1062,7 +1119,8 @@ class TTModelRunner:
         # - chunked-prefill continuations (cached requests that haven't
         #   finished computing all their prompt tokens yet).
         has_chunked_continuation = any(
-            input_batch.num_computed_tokens_cpu[input_batch.req_id_to_index[req_id]]
+            req_id in self._prefilling_req_ids
+            or input_batch.num_computed_tokens_cpu[input_batch.req_id_to_index[req_id]]
             < input_batch.num_prompt_tokens[input_batch.req_id_to_index[req_id]]
             for req_id in cached_reqs.req_ids
             if req_id not in cached_reqs.resumed_req_ids
@@ -1083,6 +1141,7 @@ class TTModelRunner:
             if cached_reqs.num_reqs > 0:
                 any_decode_in_prefill = any(
                     req_id not in cached_reqs.resumed_req_ids
+                    and req_id not in self._prefilling_req_ids
                     and input_batch.num_computed_tokens_cpu[
                         input_batch.req_id_to_index[req_id]
                     ]
@@ -1117,6 +1176,12 @@ class TTModelRunner:
             intermediate_prefill_mask = torch.from_numpy(
                 prompt_lens < input_batch.num_tokens[req_indices]
             )
+            for row, req_index in enumerate(req_indices):
+                req_id = input_batch.req_ids[req_index]
+                if intermediate_prefill_mask[row]:
+                    self._prefilling_req_ids.add(req_id)
+                else:
+                    self._prefilling_req_ids.discard(req_id)
             max_prefill_tokens = int(max(prompt_lens))
             input_tokens = input_batch.token_ids_cpu_tensor[
                 req_indices, :max_prefill_tokens
@@ -1129,6 +1194,28 @@ class TTModelRunner:
                 req_indices, positions_np
             ].view(-1, 1)
             prompt_lens = None
+            scheduled_drafts = scheduler_output.scheduled_spec_decode_tokens
+            speculative_drafts = None
+            if self.speculation_enabled and len(req_indices) == 1:
+                req_index = req_indices[0]
+                req_id = input_batch.req_ids[req_index]
+                drafts = [int(t) for t in scheduled_drafts.get(req_id, ())]
+                position = int(input_positions[0])
+                req_state = self.requests[req_id]
+                # Ownership is the scheduler's real list, never padded block_tables.
+                owned_pages = req_state.block_ids[0]
+                needed_pages = (position + self.speculative_depth) // self.cache_config.block_size + 1
+                if (len(drafts) == self.speculative_depth
+                        and all(0 <= t < self.vocab_size for t in drafts)
+                        and len(owned_pages) >= needed_pages
+                        and num_sched[req_id] >= self.speculative_depth + 1
+                        and int(input_batch.num_computed_tokens_cpu[req_index]) == position
+                        and self._speculation_remaining(req_id) >= self.speculative_depth + 1
+                        and self._speculation_context_fits(position)
+                        and (not self.dflash_enabled or (
+                            self._speculative_owner == req_id and self._dflash_context_valid
+                        ))):
+                    speculative_drafts = drafts
             # For on-device decode sampling, tell the backend if the padded
             # decode batch layout changed since the previous step.
             reset_batch = self._decode_layout_changed_since_last_decode
@@ -1224,11 +1311,19 @@ class TTModelRunner:
             # state available before inputs are gathered.
             perform_device_sampling = False
 
-        # Populate prompt_tokens and output_tokens if penalties are needed
-        # (decode only).
+        exact_sampling = None
+        if not is_prompt and speculative_drafts is None:
+            exact_sampling = self._exact_sampling_rows(
+                [input_batch.req_ids[i] for i in req_indices], has_structured
+            )
+            if exact_sampling is not None:
+                perform_device_sampling = True
+
+        # Preserve the prompt/output distinction for penalty sampling, including
+        # the final recomputation chunk of a preempted request.
         prompt_tokens = None
         output_tokens = None
-        if (not input_batch.no_penalties) and not is_prompt:
+        if not input_batch.no_penalties and exact_sampling is None:
             # Restrict to this build's requests. For lane builds ``req_indices``
             # selects one lane's rows out of the merged batch; passing them
             # keeps penalty history attributed to the right requests instead of
@@ -1240,7 +1335,8 @@ class TTModelRunner:
             # Pad batch to max_num_reqs for non-DP case (don't send padding for
             # DP to reduce overhead from gathering inputs to rank 0).
             if (
-                self.tt_data_parallel_size == 1
+                not is_prompt
+                and self.tt_data_parallel_size == 1
                 and prompt_tokens.shape[0] < input_batch.max_num_reqs
             ):
                 batch_pad = input_batch.max_num_reqs - prompt_tokens.shape[0]
@@ -1341,7 +1437,61 @@ class TTModelRunner:
             # state. Stateless models ignore it.
             prefill_empty_slots=prefill_empty_slots,
             intermediate_prefill_mask=intermediate_prefill_mask,
+            speculative_drafts=(speculative_drafts if not is_prompt else None),
+            exact_sampling=exact_sampling,
         )
+
+    def _exact_sampling_request(self, req_id: str):
+        """A device_sampling.SamplingRequest for req_id, or None when the host sampler must handle it."""
+        from models.demos.blackhole.qwen36.tt.device_sampling import SamplingRequest, device_eligible, row_sampling
+
+        state = self.requests[req_id]
+        params = state.sampling_params
+        if not device_eligible(params, len(state.output_token_ids)):
+            return None
+        owner = self._exact_owners.get(req_id)
+        if owner is None or owner[0] is not state:
+            # A history owner per request lifetime (an aborted and resubmitted id gets a new one). Unseeded
+            # requests draw a random 64-bit base seed for the counter-based RNG.
+            self._exact_owner_counter += 1
+            seed = params.seed if params.seed is not None else int.from_bytes(os.urandom(8), "little")
+            owner = (state, self._exact_owner_counter, seed)
+            self._exact_owners[req_id] = owner
+        return SamplingRequest(
+            owner=owner[1],
+            spec=row_sampling(params, owner[2]),
+            outputs=state.output_token_ids,
+            prompt=state.prompt_token_ids if params.repetition_penalty != 1.0 else None,
+        )
+
+    def _exact_sampling_rows(self, req_ids: list[str], has_structured: bool):
+        """Per-row exact device sampling requests for a decode step, or None for the host sampler (all-greedy
+        unpenalized batches keep their existing path; any ineligible row sends the whole step to the host)."""
+        if not self.supports_exact_device_sampling or has_structured or not req_ids:
+            return None
+        if self.model_config.logits_processors:
+            return None
+        if self.input_batch.all_greedy and self.input_batch.no_penalties:
+            return None
+        rows = []
+        for req_id in req_ids:
+            request = self._exact_sampling_request(req_id)
+            if request is None:
+                return None
+            rows.append(request)
+        return rows
+
+    def _speculation_request(self, has_structured_outputs: bool):
+        """(speculate, sampling request): greedy unpenalized requests keep the greedy device cycle (request None);
+        eligible random/penalized single requests run the sampled cycle."""
+        if self.input_batch.all_greedy and self._device_sampling_request_supported(has_structured_outputs):
+            return True, None
+        if not self.supports_sampled_speculation or self.dflash_enabled or has_structured_outputs:
+            return False, None
+        if self.model_config.logits_processors:
+            return False, None
+        request = self._exact_sampling_request(self.input_batch.req_ids[0])
+        return request is not None, request
 
     def build_model_input(
         self,
@@ -2454,6 +2604,8 @@ class TTModelRunner:
             return self.apply_and_build_runner_output(
                 torch.tensor([], dtype=torch.int32), None
             )
+        if isinstance(fwd.tt_out, tuple) and fwd.tt_out and fwd.tt_out[0] == "tt_speculative":
+            return self._finish_speculative(fwd)
         fwd = replace(
             fwd,
             model_input=self._apply_grammar_to_input(
@@ -2480,7 +2632,112 @@ class TTModelRunner:
                     intermediate_mask=intermediate_mask,
                 )
 
-        return self.apply_and_build_runner_output(sampled_token_ids, logprobs)
+        out = self.apply_and_build_runner_output(sampled_token_ids, logprobs)
+        self._pending_draft_token_ids = None
+        speculate, spec_request = False, None
+        if (
+            self.speculation_enabled
+            and sampled_token_ids.shape[0] == 1
+            and self.input_batch.num_reqs == 1
+            and self._speculation_context_fits(int(self.input_batch.num_tokens[0]) - 1)
+            and self._speculation_remaining(self.input_batch.req_ids[0]) >= self.speculative_depth + 1
+            and not self._speculation_stopped(self.input_batch.req_ids[0])
+            and (not self.dflash_enabled or (
+                not fwd.is_decode and self._dflash_context_valid
+                and self.model.dflash_available()
+            ))
+        ):
+            speculate, spec_request = self._speculation_request(
+                any(mask is not None for mask in fwd.model_input.grammar_bitmask)
+            )
+        if speculate:
+            first_token = int(sampled_token_ids.reshape(-1)[0])
+            position = int(self.input_batch.num_tokens[0]) - 1
+            if self.dflash_enabled:
+                drafts = self.model.dflash_first_drafts(first_token, position)
+            elif spec_request is not None:
+                drafts = self.model.mtp_first_drafts(first_token, position, request=spec_request)
+            else:
+                drafts = self.model.mtp_first_drafts(first_token, position)
+            req_id = self.input_batch.req_ids[0]
+            self._speculative_owner = req_id
+            if len(drafts) == self.speculative_depth:
+                self._pending_draft_token_ids = DraftTokenIds([req_id], [drafts])
+        if (self.speculation_enabled and self.input_batch.num_reqs == 1
+                and self._speculation_stopped(self.input_batch.req_ids[0])):
+            self._reset_speculation()
+        return out
+
+    def _finish_speculative(self, fwd: _SyncForward) -> ModelRunnerOutput:
+        _, emitted, next_drafts = fwd.tt_out
+        req_id = self.input_batch.req_ids[0]
+        # Only target-committed outputs enter runner history. Stop at the same
+        # token boundary as the scheduler, not after a bonus beyond EOS.
+        committed = []
+        for tok in emitted:
+            self._apply_sampled_tokens_to_state(torch.tensor([[tok]], dtype=torch.int32))
+            committed.append(int(tok))
+            if self._speculation_stopped(req_id):
+                break
+        self._pending_draft_token_ids = None
+        if self._speculation_stopped(req_id):
+            self._reset_speculation()
+        elif (self._speculation_context_fits(int(self.input_batch.num_tokens[0]) - 1)
+                and self._speculation_remaining(req_id) >= self.speculative_depth + 1
+                and len(next_drafts) == self.speculative_depth
+                and (not self.dflash_enabled or self._dflash_context_valid)):
+            self._pending_draft_token_ids = DraftTokenIds([req_id], [next_drafts])
+        num_reqs = self.input_batch.num_reqs
+        output_req_ids = list(self.input_batch.req_ids[:num_reqs])
+        return ModelRunnerOutput(
+            req_ids=output_req_ids,
+            req_id_to_index={r: i for i, r in enumerate(output_req_ids)},
+            sampled_token_ids=[committed],
+            logprobs=None,
+            prompt_logprobs_dict=dict.fromkeys(output_req_ids, None),
+            pooler_output=[],
+        )
+
+    def _speculation_context_fits(self, position: int) -> bool:
+        limit = self.model_config.max_model_len
+        if self.dflash_enabled:
+            limit = min(limit, self.speculative_config.max_model_len or limit)
+            return position + 2 * self.speculative_depth + 1 < limit
+        return position < limit - 2 * self.speculative_depth
+
+    def _speculation_remaining(self, req_id: str) -> int:
+        state = self.requests[req_id]
+        params = state.sampling_params
+        remaining = self.model_config.max_model_len - state.num_tokens
+        if params.max_tokens is not None:
+            remaining = min(remaining, params.max_tokens - len(state.output_token_ids))
+        return remaining
+
+    def _speculation_stopped(self, req_id: str) -> bool:
+        state = self.requests[req_id]
+        params = state.sampling_params
+        if self._speculation_remaining(req_id) <= 0:
+            return True
+        return (
+            bool(state.output_token_ids)
+            and len(state.output_token_ids) >= params.min_tokens
+            and not params.ignore_eos
+            and state.output_token_ids[-1] in params.all_stop_token_ids
+        )
+
+    def _reset_speculation(self) -> None:
+        self._pending_draft_token_ids = None
+        self._speculative_owner = None
+        self._dflash_context_valid = False
+        if self.dflash_enabled:
+            self.model.dflash_reset()
+
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        draft = self._pending_draft_token_ids
+        self._pending_draft_token_ids = None
+        if self.dflash_enabled and not self._dflash_context_valid:
+            return None
+        return draft
 
     def _build_chunked_prefill_output(
         self,
@@ -2587,9 +2844,24 @@ class TTModelRunner:
         )
         if not want_device_sampling:
             return False
+        return self._device_sampling_request_supported(has_structured_outputs)
+
+    def _device_sampling_request_supported(self, has_structured_outputs: bool) -> bool:
+        # Native speculative cycles own their argmax and return committed token
+        # IDs. They share these request restrictions, but do not require the
+        # ordinary decode SamplingGenerator or sample_on_device_mode.
 
         # Calculate number of devices per DP rank
         num_devices = self.num_devices // self.tt_data_parallel_size
+        if (
+            num_devices == 1
+            and self.supports_greedy_only_sample_on_device
+            and (
+                not self.input_batch.all_greedy
+                or not self.input_batch.no_penalties
+            )
+        ):
+            return False
 
         # Always host-only sampling params: min_p, bad_words, logit_bias,
         # allowed_token_ids, min_tokens require host sampling.
@@ -2637,6 +2909,16 @@ class TTModelRunner:
         Launches TT prefill and returns the raw TT output used by the
         synchronous extraction path.
         """
+        if self.dflash_enabled:
+            req_id = self.input_batch.req_ids[0]
+            # A nonzero start is an exact prefix resume (prefix_resume.py): the model restores the
+            # drafter context of the resumed boundary, so the request is still prefilled completely.
+            if int(model_input.prompt_lens[0]) != int(self.input_batch.num_tokens[0]):
+                raise ValueError("TT DFlash requires complete request prefill")
+            # Reset BEFORE target prefill captures the drafter's features.
+            self._reset_speculation()
+            self._speculative_owner = req_id
+            self._dflash_context_valid = True
         kwargs = {
             "tokens": model_input.input_tokens,
             "page_table": model_input.block_tables,
@@ -2727,7 +3009,60 @@ class TTModelRunner:
                 tt_out, tt_log_probs = tt_out
             elif isinstance(tt_out, tuple):
                 tt_out, _ = tt_out
+        elif (
+            self.speculation_enabled
+            and model_input.speculative_drafts is not None
+            and (not self.dflash_enabled or (
+                self._dflash_context_valid and self.model.dflash_available()
+            ))
+            and (spec := self._speculation_request(
+                any(mask is not None for mask in model_input.grammar_bitmask)
+            ))[0]
+        ):
+            # Verification advances committed host state, not the ordinary
+            # decode/sampler inputs. Keep their reset pending until an ordinary
+            # decode consumes the committed token and position.
+            self._decode_layout_changed_since_last_decode = True
+            _t0 = time.perf_counter()
+            step = self.model.dflash_step if self.dflash_enabled else self.model.mtp_step
+            step_kwargs = {"request": spec[1]} if spec[1] is not None else {}
+            emitted, next_drafts = step(
+                int(model_input.input_tokens[0, 0]),
+                model_input.speculative_drafts,
+                int(model_input.input_positions[0]),
+                self.requests[self.input_batch.req_ids[0]].block_ids[0],
+                **step_kwargs,
+            )
+            self._speculative_stats = getattr(self, "_speculative_stats", {"cycles": 0, "accepted": 0, "ms": 0.0})
+            self._speculative_stats["cycles"] += 1
+            self._speculative_stats["accepted"] += len(emitted) - 1
+            self._speculative_stats["ms"] += (time.perf_counter() - _t0) * 1000
+            branch_stats = self.model.dflash_branch_stats() if self.dflash_enabled else None
+            if branch_stats is not None:
+                for key, value in branch_stats.items():
+                    self._speculative_stats[key] = self._speculative_stats.get(key, 0) + value
+            if self._speculative_stats["cycles"] % 32 == 0:
+                logger.info("TT %s stats cycles=%d accepted=%d mean_cycle_ms=%.3f", self.speculative_method, self._speculative_stats["cycles"], self._speculative_stats["accepted"], self._speculative_stats["ms"] / self._speculative_stats["cycles"])
+                if branch_stats is not None:
+                    logger.info("TT dflash tree stats cycles=%d secondary_wins=%d extra_tokens=%d accepted_a=%d accepted_b=%d",
+                                self._speculative_stats["cycles"], self._speculative_stats["winner"],
+                                self._speculative_stats["extra_tokens"], self._speculative_stats["accepted_a"],
+                                self._speculative_stats["accepted_b"])
+            return _SyncForward(
+                tt_out=("tt_speculative", emitted, next_drafts),
+                tt_log_probs=None,
+                sampling_params=sampling_params,
+                model_input=model_input,
+                batch_size_per_dp=batch_size_per_dp,
+                perform_device_sampling=False,
+                is_decode=True,
+            )
         else:
+            self._pending_draft_token_ids = None
+            if self.dflash_enabled:
+                # Ordinary decode does not capture target taps. Never reseed
+                # from a partial DFlash history; only a true prefill can rearm.
+                self._reset_speculation()
             submission = self.async_decode.submit_decode(
                 model_input, read_from_device=False, async_read=False
             )
@@ -3010,7 +3345,7 @@ class TTModelRunner:
 
                 # Output history as list[list[int]] (filter TT -1 padding).
                 output_token_ids: list[list[int]] = []
-                if is_decode and model_input.output_tokens is not None:
+                if model_input.output_tokens is not None:
                     output_tokens = _take(model_input.output_tokens)
                     for i in range(sz):
                         output_tokens_i = output_tokens[i].tolist()
@@ -3024,7 +3359,7 @@ class TTModelRunner:
                 # valid index (vocab_size), not TT's -1 sentinel.
                 prompt_token_ids: torch.Tensor | None = None
                 if not no_penalties:
-                    if is_decode and model_input.prompt_tokens is not None:
+                    if model_input.prompt_tokens is not None:
                         prompt_token_ids = _take(model_input.prompt_tokens).to(
                             torch.int64
                         )

@@ -7,12 +7,15 @@ logger = init_tt_logger(__name__)
 
 
 def register() -> None:
-    """Register TT models, reasoning parsers and tool parsers in every vLLM process."""
+    """Register TT models, reasoning parsers and tool parsers, and the toks prompt encoding (VLLM_TT_TOKS), in
+    every vLLM process."""
     from vllm_tt_plugin.model_registry import register_tt_models_from_plugin
+    from vllm_tt_plugin.toks_tokenizer import install as install_toks_prompt_encoding
 
     register_tt_models_from_plugin()
     _register_tt_reasoning_parsers()
     _register_tt_tool_parsers()
+    install_toks_prompt_encoding()
 
 
 def _register_tt_reasoning_parsers() -> None:

@@ -10,6 +10,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.request import Request
 from vllm_tt_plugin.logger import init_tt_logger
+from vllm_tt_plugin.prefix_resume import REGISTRY
 
 logger = init_tt_logger(__name__)
 
@@ -107,10 +108,9 @@ class TTScheduler(AsyncScheduler):
       queue is non-empty).
     - ``TTSchedulingMode.PREFILL_ONLY`` forces prefill-only (and may return an
       empty batch when waiting is empty).
-    - ``TTSchedulingMode.DEFAULT`` uses the default policy: prefer prefill
-      when pending prefill work exists (waiting queue or partial-prefill
-      continuations), falling back to decode-only when prefill cannot make
-      progress and running decode requests exist.
+    - ``TTSchedulingMode.DEFAULT`` normally prefers prefill. Single-device
+      batched Qwen instead runs a decode turn before each bounded prefill
+      turn whenever both phases have work; neither phase can starve the other.
     """
 
     waiting: RequestQueue
@@ -120,6 +120,42 @@ class TTScheduler(AsyncScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._forced_mode = TTSchedulingMode.DEFAULT
+        if self.cache_config.enable_prefix_caching:
+            # Prefix hits come from exact model-side resume snapshots, not raw block hashes.
+            REGISTRY.attach(self.kv_cache_manager)
+        self._qwen_batched_prefill = bool(
+            (self.vllm_config.additional_config or {}).get("_tt_qwen_batched_prefill", False)
+        )
+        self._prefill_turn_due = False
+        if self._qwen_batched_prefill:
+            # Reuse the upstream pre-allocation alignment hook. Qwen's state
+            # is model-owned, not a Mamba cache group, so its split rule below
+            # deliberately does not inspect mamba_spec or cache mode.
+            self.need_mamba_block_aligned_split = True
+
+    def _mamba_block_aligned_split(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_new_local_computed_tokens: int = 0,
+        num_external_computed_tokens: int = 0,
+    ) -> int:
+        if not self._qwen_batched_prefill:
+            return super()._mamba_block_aligned_split(
+                request, num_new_tokens,
+                num_new_local_computed_tokens, num_external_computed_tokens,
+            )
+        start = (
+            request.num_computed_tokens
+            + num_new_local_computed_tokens
+            + num_external_computed_tokens
+        )
+        if start + num_new_tokens < request.num_tokens:
+            # Every non-final chunk ends on a GDN scan boundary (128) and
+            # therefore also a paged-KV boundary (64). A short remaining turn
+            # budget simply leaves this request for the next prefill turn.
+            return max(0, (start + num_new_tokens) // 128 * 128 - start)
+        return num_new_tokens
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
@@ -149,6 +185,17 @@ class TTScheduler(AsyncScheduler):
             # No pending prefill: base scheduler naturally runs decode-only.
             result = super().schedule()
             return self._finalize_scheduler_output(result)
+
+        if self._qwen_batched_prefill:
+            if not has_pending_prefill:
+                self._prefill_turn_due = False
+            elif has_running and not self._prefill_turn_due:
+                result = self._schedule_decode_only()
+                if result.total_num_scheduled_tokens:
+                    self._prefill_turn_due = True
+                    return self._finalize_scheduler_output(result)
+            # At most one prefill turn may intervene between decode turns.
+            self._prefill_turn_due = False
 
         # Default mode:
         # Prefer prefill whenever there is pending prefill work - either new
@@ -185,6 +232,9 @@ class TTScheduler(AsyncScheduler):
         partial_prefills = [r for r in self.running if r.is_prefill_chunk]
 
         saved_max = self.max_num_running_reqs
+        saved_budget = self.max_num_scheduled_tokens
+        if self._qwen_batched_prefill:
+            self.max_num_scheduled_tokens = min(saved_budget, 2048)
         self.running = partial_prefills
         self.max_num_running_reqs = max(0, saved_max - len(pure_decodes))
         try:
@@ -192,6 +242,7 @@ class TTScheduler(AsyncScheduler):
         finally:
             self.running.extend(pure_decodes)
             self.max_num_running_reqs = saved_max
+            self.max_num_scheduled_tokens = saved_budget
         return result
 
     def _schedule_decode_only(self) -> SchedulerOutput:
