@@ -1441,12 +1441,29 @@ class TTModelRunner:
             exact_sampling=exact_sampling,
         )
 
-    def _exact_sampling_request(self, req_id: str):
-        """A device_sampling.SamplingRequest for req_id, or None when the host sampler must handle it."""
-        from models.demos.blackhole.qwen36.tt.device_sampling import SamplingRequest, device_eligible, row_sampling
+    def _exact_sampling_api(self):
+        """(SamplingRequest, device_eligible, row_sampling) for this model's exact device sampler.
 
-        # A model may declare its own exactly-sampled set (Inkling-2-Mini: the full-vocabulary device sampler).
-        device_eligible = getattr(self.model, "device_sampling_eligible", device_eligible)
+        A model that brings its own sampler declares both hooks (``device_sampling_eligible`` and
+        ``device_row_sampling``) and gets the plugin's own SamplingRequest; the plugin then never imports another
+        model's package.  Otherwise the Qwen3.6 runtime's device_sampling module (the API this was written for)."""
+        api = getattr(self, "_exact_api", None)
+        if api is None:
+            eligible = getattr(self.model, "device_sampling_eligible", None)
+            row_sampling = getattr(self.model, "device_row_sampling", None)
+            if eligible is not None and row_sampling is not None:
+                from vllm_tt_plugin.exact_sampling import SamplingRequest
+            else:
+                from models.demos.blackhole.qwen36.tt import device_sampling as ds
+
+                SamplingRequest, row_sampling = ds.SamplingRequest, ds.row_sampling
+                eligible = eligible or ds.device_eligible
+            api = self._exact_api = (SamplingRequest, eligible, row_sampling)
+        return api
+
+    def _exact_sampling_request(self, req_id: str):
+        """A SamplingRequest for req_id, or None when the host sampler must handle it."""
+        SamplingRequest, device_eligible, row_sampling = self._exact_sampling_api()
         state = self.requests[req_id]
         params = state.sampling_params
         if not device_eligible(params, len(state.output_token_ids)):

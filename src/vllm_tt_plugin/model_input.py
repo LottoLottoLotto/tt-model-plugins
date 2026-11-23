@@ -131,5 +131,5 @@ class TTModelInput:
     # consume a sampling RNG draw because more prompt tokens remain.
     intermediate_prefill_mask: torch.Tensor | None = None
     speculative_drafts: list[int] | None = None
-    # Per-row device_sampling.SamplingRequest for exact on-device sampling of this decode step (None: host).
+    # Per-row SamplingRequest (exact_sampling.py or the model's own) for exact on-device sampling (None: host).
     exact_sampling: list[Any] | None = None
