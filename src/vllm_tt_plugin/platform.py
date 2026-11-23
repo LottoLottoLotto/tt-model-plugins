@@ -843,10 +843,12 @@ class TTPlatform(Platform):
         )
         _apply_chunked_prefill_policy(vllm_config, model_capabilities)
         if vllm_config.additional_config.get("_tt_qwen_batched_prefill", False):
-            # The concurrent target returns ordinary per-row vocabulary logits.
-            # Keep random sampling, penalties and logprobs on vLLM's host path.
-            sample_on_device_mode = None
-            cls.sample_on_device_mode = None
+            # The concurrent decode trace has a greedy variant that argmaxes on
+            # device and returns only token ids. The runner selects it for
+            # all-greedy decode steps and keeps random sampling, penalties,
+            # logprobs and structured output on vLLM's host path.
+            sample_on_device_mode = "decode_only"
+            cls.sample_on_device_mode = "decode_only"
 
         # A model either supports the full on-device sampling pipeline or it
         # doesn't — there is no greedy-only mode. Models opt in by setting

@@ -2927,6 +2927,14 @@ class TTModelRunner:
             "prompt_lens": model_input.prompt_lens,
             "start_pos": model_input.input_positions,
         }
+        from vllm_tt_plugin.prefix_resume import REGISTRY
+
+        if REGISTRY.active and model_input.intermediate_prefill_mask is not None:
+            # Exact prefix resume in batched prefill: the request of each row (the model asks
+            # the registry whether it was resumed) and the rows that end their prompt now.
+            rows = int(model_input.unpadded_batch_size)
+            kwargs["prefill_request_ids"] = list(self.input_batch.req_ids[:rows])
+            kwargs["prefill_final_rows"] = (~model_input.intermediate_prefill_mask[:rows]).tolist()
         # Hybrid attention models route per-layer block tables; the
         # runner already expanded ``block_tables_per_group`` into a
         # per-layer list at submission time when the kv_cache_config has

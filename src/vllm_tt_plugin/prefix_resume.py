@@ -64,15 +64,18 @@ class PrefixResume:
         self._lengths: dict[int, int] = {}  # length -> number of snapshots with it
         self._pending: dict[str, bytes] = {}  # request id -> key handed to the scheduler
         self._epoch: dict[int, int] = {}
+        self.fork_hints = False  # scheduler asks for snapshots where cached prompts fork
+        self._wanted: OrderedDict[bytes, int] = OrderedDict()  # prefix key -> boundary
         self.stats = {"queries": 0, "hits": 0, "hit_tokens": 0, "query_tokens": 0, "puts": 0,
                       "evicted": 0, "stale": 0}
 
     # ---- model side -------------------------------------------------------------------------
-    def configure(self, align: int, block_size: int, max_snapshots: int) -> None:
+    def configure(self, align: int, block_size: int, max_snapshots: int, fork_hints: bool = False) -> None:
         if align <= 0 or block_size <= 0 or align % block_size:
             raise ValueError("resume alignment must be a positive multiple of the KV block size")
         with self._lock:
             self.align, self.block_size, self.max_snapshots = align, block_size, max(0, max_snapshots)
+            self.fork_hints = fork_hints
         logger.info("Prefix resume: chunk %d, block %d, max snapshots %d", align, block_size, max_snapshots)
 
     @property
@@ -104,19 +107,54 @@ class PrefixResume:
                 self._forget_length(self._snapshots.pop(victim).length)
                 self.stats["evicted"] += 1
 
-    def take(self, tokens, length: int) -> Any:
-        """Payload of the snapshot the scheduler resumed this prefill from."""
+    def take(self, tokens, length: int, request_id: str | None = None) -> Any:
+        """Payload of the snapshot the scheduler resumed this prefill from. With ``request_id``
+        only that request is unpinned: concurrent requests may resume from one snapshot."""
         key = token_key(tokens, length)
         with self._lock:
             snapshot = self._snapshots.get(key)
-            for request_id in [r for r, k in self._pending.items() if k == key]:
-                del self._pending[request_id]
+            if request_id is not None:
+                if self._pending.pop(request_id, None) != key:
+                    raise RuntimeError(f"request {request_id} was not scheduled to resume at {length}")
+            else:
+                for pinned in [r for r, k in self._pending.items() if k == key]:
+                    del self._pending[pinned]
             if snapshot is None or snapshot.length != length:
                 raise RuntimeError(f"no prefix-resume snapshot for the scheduled {length}-token prefix")
             self._snapshots.move_to_end(key)
             return snapshot.payload
 
+    def resuming(self, request_id: str) -> bool:
+        """Whether the scheduler resumed this request from a snapshot (not yet taken)."""
+        with self._lock:
+            return request_id in self._pending
+
+    def has(self, tokens, length: int) -> bool:
+        if length not in self._lengths:
+            return False
+        key = token_key(tokens, length)
+        with self._lock:
+            return key in self._snapshots
+
+    def wanted(self, tokens, length: int) -> bool:
+        """Consume a scheduler request to snapshot ``tokens[:length]`` (a fork boundary)."""
+        with self._lock:
+            if length not in self._wanted.values():
+                return False
+            return self._wanted.pop(token_key(tokens, length), None) is not None
+
     # ---- scheduler side ---------------------------------------------------------------------
+    def want(self, tokens, length: int) -> None:
+        """Ask the model to snapshot ``tokens[:length]`` when a prefill crosses that boundary."""
+        key = token_key(tokens, length)
+        with self._lock:
+            if key in self._snapshots:
+                return
+            self._wanted[key] = length
+            self._wanted.move_to_end(key)
+            while len(self._wanted) > 4 * max(1, self.max_snapshots):
+                self._wanted.popitem(last=False)
+
     def on_new_blocks(self, blocks) -> None:
         epoch = self._epoch
         for block in blocks:
@@ -190,6 +228,20 @@ class PrefixResume:
                 kv_cache_manager.prefix_cache_stats.record(
                     num_tokens=request.num_tokens, num_hits=length, preempted=request.num_preemptions > 0
                 )
+            if self.fork_hints and self.max_snapshots and not (
+                request.skip_reading_prefix_cache or request.mm_features or request.lora_request is not None
+                or getattr(request, "cache_salt", None)
+            ):
+                # vLLM's block hashes only locate where this prompt leaves another cached prompt
+                # (shared system prompt / document); their KV is never reused. The prefill
+                # publishes a snapshot at the last chunk boundary inside the shared part, so
+                # later requests with that prefix resume there.
+                shared = kv_cache_manager.coordinator.find_longest_cache_hit(
+                    request.block_hashes, request.num_tokens - 1
+                )[1]
+                fork = shared // self.align * self.align
+                if fork > length:
+                    self.want(request.all_token_ids, fork)
             if not length:
                 return kv_cache_manager.empty_kv_cache_blocks, 0
             logger.info("Prefix resume: request %s resumes at %d of %d tokens", request.request_id, length,

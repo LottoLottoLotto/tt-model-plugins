@@ -154,7 +154,12 @@ class TTScheduler(AsyncScheduler):
             # Every non-final chunk ends on a GDN scan boundary (128) and
             # therefore also a paged-KV boundary (64). A short remaining turn
             # budget simply leaves this request for the next prefill turn.
-            return max(0, (start + num_new_tokens) // 128 * 128 - start)
+            # With prefix caching (exact prefix resume) non-final chunks end on
+            # the model's prefill chunk (2048) instead: every request then runs
+            # the same position-aligned chunk schedule whatever the load, so
+            # snapshots and resumes fall on boundaries a full prefill crosses.
+            align = REGISTRY.align if (self.cache_config.enable_prefix_caching and REGISTRY.align) else 128
+            return max(0, (start + num_new_tokens) // align * align - start)
         return num_new_tokens
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
